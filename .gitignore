@@ -1,0 +1,21 @@
+# Build artifacts
+__pycache__/
+*.pyc
+
+# Licensed Definitive Healthcare exports — do not redistribute.
+# Confirm terms with the licence owner before these leave this machine.
+Definitive_*.xlsx
+
+# Run outputs: Zeus client data (names, addresses), regenerable from the
+# query + sources.yaml. Keep <out>_zeus_extract.csv alongside any circulated
+# result — it is the only way to reproduce a figure later.
+audit_*_scored.csv
+audit_*_unverifiable.csv
+audit_*_zeus_extract.csv
+
+# Generated deliverables
+Zeus_DHC_ID_Accuracy_Audit*.xlsx
+
+# Secrets, in case one ever lands here
+.env
+*.local.yaml
