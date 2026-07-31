@@ -1,0 +1,118 @@
+# Zeus <-> Definitive identifier verification - source configuration
+#
+# Regenerate the "definitive:" blocks for any new export with:
+#     python dhc_match_v2.py inspect <export.xlsx>
+# then paste the detected roles here and sanity-check them.
+#
+# Run with:
+#     python dhc_match_v2.py run --config sources.yaml --out audit_2026_08
+
+zeus:
+  # Zeus is read live from the failover replica. The query defines the
+  # population - note it excludes entities created by a Definitive import
+  # (see the EntityDescription filter), so the row count is NOT the historic
+  # 207,450 and corroboration rates are not comparable to runs before it.
+  query_file: Zeus Client to Definitive ID data quality evaluation.sql
+
+  connection:
+    driver: ODBC Driver 18 for SQL Server
+    host: prd-jcl-zeus-failover.ff2d73e4c70e.database.windows.net
+    port: 1433
+    database: Zeus
+    user: JCBIReportUser
+    # The secret is never stored here. Set the environment variable instead.
+    password_env: ZEUS_SQL_PASSWORD
+    encrypt: true
+    trust_server_certificate: true
+    # Mandatory: the host is a failover-group listener, and reaching the
+    # readable secondary requires the intent to be declared explicitly.
+    application_intent: ReadOnly
+    multi_subnet_failover: true
+
+  # A file can still be used instead of `query_file` - an archived extract,
+  # or an offline re-run. Set `path:` and the connection block is ignored.
+  # path: zeus_extract.csv
+
+  key: EntityId                     # unique Zeus row key
+  # Tried in order; the first non-null wins. Where both are populated and
+  # disagree the row is flagged in DHC_Id_Conflict.
+  id_columns:
+    - Entity_DHC_VerifiedSourceId
+    - LEVS_DHC_VerifiedSourceId
+  # Zeus's two name fields are ALIASES of one another, not a primary plus a
+  # fallback. Every one is scored against the Definitive side and the best match
+  # wins, in both the forward pass and the reverse lookup.
+  # `ClientEntityName` is `e.Name` in the query (it was `EntityName` before
+  # 2026-07-31); `ClientInfoName` is `ci.ClientInfoName`.
+  name:
+    - ClientEntityName
+    - ClientInfoName
+  address:                          # the street line is not always the first
+    - ClientAddress1
+    - ClientAddress2
+    - ClientAddress3
+  city: ClientCity
+  state: ClientState                # full names or codes both fine
+  zip: ClientZip
+
+# ---------------------------------------------------------------------------
+# IDENTITY sources: one row per Definitive entity. These decide what an id IS.
+#
+# Definitive ids share a single namespace across entity types, so stacking
+# these widens the testable population without collisions - verified, the three
+# sets below share no ids at all. All four exports were re-cut on 2026-07-31 to
+# a common `DefinitiveId` key; the older HospitalId / HOSPITAL_ID column names
+# are gone.
+# ---------------------------------------------------------------------------
+definitive:
+  - path: Definitive_HospitalOverview.xlsx
+    entity_type: Hospital
+    id: DefinitiveId
+    name: Name
+    address: [AddressHq, Address1Hq]
+    city: HqCity
+    state: HqState
+    zip: HqZipCode
+
+  - path: Definitive_PhysicianGroupOverview.xlsx
+    entity_type: PhysicianGroup
+    id: DefinitiveId
+    name: Definitive_NAME
+    address: [HQ_ADDRESS, HQ_ADDRESS1]
+    city: HQ_CITY
+    state: HQ_STATE
+    zip: HQ_ZIP_CODE
+
+  - path: Definitive_GPO_Overview.xlsx
+    entity_type: GPO
+    id: DefinitiveId
+    name: Name
+    address: [HeadquartersAddress, HeadquartersAddress1]
+    city: HeadquartersCity
+    state: HeadquartersState
+    zip: HeadquartersZipCode
+
+# ---------------------------------------------------------------------------
+# LOCATION sources: MANY rows per Definitive id - one per service location.
+#
+# Do NOT list these under `definitive:`. The id is the parent entity's, not the
+# location's (399,990 rows, 176,658 distinct ids, one id has 962 locations), so
+# stacking them as identity would let an arbitrary location overwrite the
+# authoritative name and HQ for 122,539 ids.
+#
+# Used instead to enrich the entity they belong to: every location address,
+# city, state and zip becomes a candidate for the address comparison, and every
+# location name becomes a name alias. This is the fix for the HQ-vs-service-
+# location gap that decision #4 exists to work around.
+#
+# Ids that appear ONLY here (54,119) still become testable, using their first
+# location row as identity, tagged entity_type PracticeLocation.
+# ---------------------------------------------------------------------------
+locations:
+  - path: Definitive_Practice_Locations.xlsx
+    id: DefinitiveId
+    name: Name
+    address: [HeadquartersAddress, HeadquartersAddress1]
+    city: HeadquartersCity
+    state: HeadquartersState
+    zip: HeadquartersZipCode

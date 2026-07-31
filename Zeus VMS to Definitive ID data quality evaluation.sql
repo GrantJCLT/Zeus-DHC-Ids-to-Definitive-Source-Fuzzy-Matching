@@ -1,0 +1,45 @@
+/* Is VMS */
+
+-- with DHC ID
+    SELECT e.EntityId
+          ,e.Name AS VMSEntityName
+          --,e.EntityDescription
+          ,ci.VMSInfoName
+          ,cia.Address1 AS VMSAddress1
+          ,cia.Address2 AS VMSAddress2          
+          ,cia.Address3 AS VMSAddress3
+          ,cia.City AS VMSCity
+          ,cia.Zip AS VMSZip
+          ,ciast.StateName AS WorkLocationState
+          --,COUNT(DISTINCT e.EntityId) AS theCount
+          --,e.VerifiedSourceNameId AS entityVerifSourceNameId
+          ,e.VerifiedSourceId AS Entity_DHC_VerifiedSourceId
+          --,levs.VerifiedSourceNameId AS linkVerifSourceNameId
+          ,levs.VerifiedSourceId AS LEVS_DHC_VerifiedSourceId
+      FROM dbo.Entity AS e
+      JOIN dbo.VMSInfo AS ci ON ci.VMSInfoId = e.EntityId
+ LEFT JOIN dbo.VMSInfoAddress AS cia ON cia.VMSInfoId = ci.VMSInfoId
+                                    AND cia.IsDefault = 1
+ LEFT JOIN dbo.State AS ciast ON ciast.StateId = cia.StateId
+ LEFT JOIN dbo.LinkEntityVerifiedSource AS levs ON levs.EntityId = e.EntityId
+     WHERE e.Archived = 0
+       AND ci.Archived = 0
+       AND e.IsVMS = 1
+       AND
+      (
+          (
+              e.VerifiedSourceNameId = 1
+              AND ISNULL(e.VerifiedSourceId, 0) <> 0
+          )
+          OR
+          (
+              levs.VerifiedSourceNameId = 1
+              AND ISNULL(levs.VerifiedSourceId, 0) <> 0
+          )
+      )
+       AND ISNULL(TRIM(e.EntityDescription), '') NOT IN
+            (
+             'Definitive Physician Group Import',
+             'Definitive Provider Import',
+             'Definitive Health System Import'
+            )
