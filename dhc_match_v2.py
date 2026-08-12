@@ -348,13 +348,14 @@ def load_config(path):
     return json.loads(txt)
 
 
-# Expected population of the live query, so drift is visible run to run.
+# Expected distinct-entity count across the six populations, so drift is visible
+# run to run. Update it deliberately when the population genuinely changes.
 #
 # Not to be confused with the 207,450-row file-era extract: that predated the
 # EntityDescription exclusion and was ~95.6% Definitive-import-created records
 # (198,395 of 207,598 measured 2026-07-31). Comparing against it would report a
 # 95% "drop" that is a change of scope, not a regression.
-ZEUS_BASELINE_ROWS = 9_171
+ZEUS_BASELINE_ENTITIES = 12_803
 
 
 def _conn_str(c):
@@ -390,70 +391,136 @@ def _conn_str(c):
     return ';'.join(parts)
 
 
-def load_zeus(zc, out_prefix=None):
-    """Zeus rows, from a live query or a file.
+# Canonical shape every Zeus population is mapped onto, so downstream code is
+# free of per-population column names.
+Z_NAMES = ['Z_Name1', 'Z_Name2']
+Z_ADDRS = ['Z_Addr1', 'Z_Addr2', 'Z_Addr3']
+Z_CANON = ['EntityId', 'Zeus_Source'] + Z_NAMES + Z_ADDRS + \
+          ['Z_City', 'Z_State', 'Z_Zip']
 
-    `query_file` reads the database; `path` reads a file, so an archived
-    extract still works for offline re-runs.
-    """
-    if zc.get('query_file'):
-        import pyodbc
-        c = zc.get('connection') or {}
-        sql = open(zc['query_file']).read()
-        print(f'Zeus source : {c.get("database")} on {c.get("host")}')
-        print(f'  query     : {zc["query_file"]}')
-        print(f'  intent    : {c.get("application_intent", "ReadWrite")}')
-        with pyodbc.connect(_conn_str(c)) as cx:
-            updateability = cx.execute(
-                "SELECT DATABASEPROPERTYEX(DB_NAME(), 'Updateability')"
-            ).fetchval()
-            print(f'  connected to a {updateability} database')
-            if c.get('application_intent') == 'ReadOnly' \
-                    and updateability != 'READ_ONLY':
-                print('  WARNING: ReadOnly intent was requested but this '
-                      'connection landed on a writable database.')
-            z = pd.read_sql(sql, cx)
-    elif zc.get('path'):
-        print(f'Zeus source : {zc["path"]}')
-        z = read_any(zc['path'])
-    else:
-        raise SystemExit('zeus config needs either `query_file` or `path`.')
 
-    key = zc.get('key')
-    if key and key in z.columns:
-        dupes = int(z[key].duplicated().sum())
-        if dupes:
-            # LinkEntityVerifiedSource can return several rows per entity, and
-            # `key` is a merge key later on - duplicates would multiply output.
-            print(f'  WARNING: {dupes:,} duplicate {key} values; '
-                  f'keeping first occurrence')
-            z = z.drop_duplicates(subset=[key], keep='first')
-
-    # Fail here, naming the column, rather than deep in the scoring loop with
-    # an AttributeError. The query's column names have changed before.
-    wanted = []
-    for role in ('key', 'city', 'state', 'zip'):
-        if zc.get(role):
-            wanted.append(zc[role])
-    for role in ('name', 'address', 'id_columns'):
-        v = zc.get(role) or []
-        wanted += v if isinstance(v, list) else [v]
-    missing = [c for c in wanted if c not in z.columns]
+def _canonicalise(df, src, idc, label):
+    """Map one population's columns onto the canonical schema."""
+    wanted = list(src.get('name') or []) + list(src.get('address') or []) + \
+        [src.get('city'), src.get('state'), src.get('zip')] + list(idc) + \
+        ['EntityId']
+    missing = [c for c in wanted if c and c not in df.columns]
     if missing:
         raise SystemExit(
-            f'Zeus source is missing configured column(s): {missing}\n'
-            f'  available: {list(z.columns)}\n'
-            f'  fix the column names in sources.yaml (or the query) to match.')
+            f'Zeus population "{label}" is missing column(s): {missing}\n'
+            f'  available: {list(df.columns)}\n'
+            f'  fix sources.yaml or the query so they match.')
+    names = list(src.get('name') or [])
+    addrs = list(src.get('address') or [])
+    out = pd.DataFrame({'EntityId': df['EntityId'], 'Zeus_Source': label})
+    for i, c in enumerate(Z_NAMES):
+        out[c] = df[names[i]] if i < len(names) else None
+    for i, c in enumerate(Z_ADDRS):
+        out[c] = df[addrs[i]] if i < len(addrs) else None
+    out['Z_City'] = df[src['city']] if src.get('city') else None
+    out['Z_State'] = df[src['state']] if src.get('state') else None
+    out['Z_Zip'] = df[src['zip']] if src.get('zip') else None
+    for c in idc:
+        out[c] = df[c]
+    return out
 
-    delta = len(z) - ZEUS_BASELINE_ROWS
-    drift = '' if delta == 0 else f'  ({delta:+,} vs the expected ' \
-                                  f'{ZEUS_BASELINE_ROWS:,})'
-    print(f'Zeus rows   : {len(z):,}{drift}')
+
+def _pool(u, idc):
+    """One row per EntityId, pooling every population's names and addresses.
+
+    An entity in both IsClient and IsWorkLocation has two names and two
+    addresses on record. Neither is authoritative, so both become candidates
+    and the best match wins - the same rule applied to Definitive locations.
+    """
+    def uniq(vals):
+        return [v for v in dict.fromkeys(vals)
+                if isinstance(v, str) and v.strip()]
+
+    rows = []
+    for eid, g in u.groupby('EntityId', sort=False):
+        ids = {}
+        for c in idc:
+            v = pd.to_numeric(g[c], errors='coerce').dropna()
+            ids[c] = int(v.iloc[0]) if len(v) else None
+        srcs = sorted(dict.fromkeys(g.Zeus_Source))
+        rows.append({
+            'EntityId': eid,
+            'Zeus_Sources': '|'.join(srcs),
+            'Zeus_Source_Count': len(srcs),
+            'Z_Names': uniq([v for c in Z_NAMES for v in g[c]]),
+            'Z_Addrs': uniq([v for c in Z_ADDRS for v in g[c]]),
+            'Z_Cities': uniq(g.Z_City),
+            'Z_States': uniq(g.Z_State),
+            'Z_Zips': [x for x in dict.fromkeys(g.Z_Zip) if pd.notna(x)],
+            **ids,
+        })
+    return pd.DataFrame(rows)
+
+
+def load_zeus(zc, out_prefix=None):
+    """Every Zeus population, canonicalised, unioned and pooled by EntityId.
+
+    `sources` reads the database (one query per population); `path` replays an
+    archived canonical union for an offline re-run.
+    """
+    idc = list(zc.get('id_columns') or [])
+    if zc.get('path'):
+        print(f'Zeus source : {zc["path"]} (archived extract)')
+        u = read_any(zc['path'])
+        missing = [c for c in Z_CANON + idc if c not in u.columns]
+        if missing:
+            raise SystemExit(f'Archived extract is missing {missing}; it must '
+                             f'be a <prefix>_zeus_extract.csv from a live run.')
+    else:
+        import pyodbc
+        c = zc.get('connection') or {}
+        srcs = zc.get('sources') or []
+        if not srcs:
+            raise SystemExit('zeus config needs `sources` (or `path`).')
+        print(f'Zeus source : {c.get("database")} on {c.get("host")}')
+        print(f'  intent    : {c.get("application_intent", "ReadWrite")}')
+        frames = []
+        with pyodbc.connect(_conn_str(c)) as cx:
+            upd = cx.execute(
+                "SELECT DATABASEPROPERTYEX(DB_NAME(), 'Updateability')"
+            ).fetchval()
+            print(f'  connected to a {upd} database')
+            if c.get('application_intent') == 'ReadOnly' and upd != 'READ_ONLY':
+                print('  WARNING: ReadOnly intent was requested but this '
+                      'connection landed on a writable database.')
+            for s in srcs:
+                label = s.get('label') or os.path.basename(s['query_file'])
+                raw = pd.read_sql(open(s['query_file']).read(), cx)
+                frames.append(_canonicalise(raw, s, idc, label))
+                print(f'  {label:14} {len(raw):>7,} rows  '
+                      f'({os.path.basename(s["query_file"])})')
+        u = pd.concat(frames, ignore_index=True)
+
+    # LinkEntityVerifiedSource can return several rows per entity within one
+    # population; collapse those before pooling across populations.
+    before = len(u)
+    u = u.drop_duplicates(subset=['EntityId', 'Zeus_Source'] + Z_NAMES +
+                          Z_ADDRS, keep='first')
+    if len(u) < before:
+        print(f'  collapsed {before - len(u):,} duplicate population rows')
 
     if out_prefix:
         snap = f'{out_prefix}_zeus_extract.csv'
-        z.to_csv(snap, index=False)
-        print(f'  extract snapshot -> {snap}')
+        u.to_csv(snap, index=False)
+        print(f'  extract snapshot -> {snap}  ({len(u):,} rows)')
+
+    z = _pool(u, idc)
+    multi = int((z.Zeus_Source_Count > 1).sum())
+    print(f'Zeus rows   : {len(u):,} population rows -> {len(z):,} distinct '
+          f'entities')
+    print(f'  {multi:,} entities appear in more than one population '
+          f'(names and addresses pooled)')
+    delta = len(z) - ZEUS_BASELINE_ENTITIES
+    if delta:
+        print(f'  NOTE: {delta:+,} vs the expected '
+              f'{ZEUS_BASELINE_ENTITIES:,} entities. Expected drift as Zeus '
+              f'changes; investigate anything large, then update '
+              f'ZEUS_BASELINE_ENTITIES.')
     return z.reset_index(drop=True)
 
 
@@ -592,13 +659,13 @@ def location_index(L, need_ids):
     return idx, capped
 
 
-def enriched_scores(z_names, z_lines, zcity, zstate, zzip, ent, loc):
-    """Every score for one Zeus row against one Definitive entity, considering
-    the HQ record and every known service location.
+def enriched_scores(z_names, z_lines, zcities, zstates, zzips, ent, loc):
+    """Every score for one Zeus entity against one Definitive entity.
 
-    `ent` is a dict of the entity's identity fields; `loc` is its
-    `location_index` entry or None. Location data can only ever improve a
-    score - each component takes the best available match.
+    Both sides are multi-valued: Zeus pools names and addresses across every
+    population the entity belongs to, and the Definitive side offers its HQ plus
+    every known service location. Each component takes the best available
+    match, so extra candidates can only ever raise a score.
     """
     aliases = list(ent['aliases'] or []) + (loc['names'] if loc else [])
     nm = name_score(z_names, ent['primary'], aliases)
@@ -610,16 +677,17 @@ def enriched_scores(z_names, z_lines, zcity, zstate, zzip, ent, loc):
 
     cities = ([ent['city']] if ent['city'] else []) + \
              (sorted(loc['cities']) if loc else [])
-    cs = max((float(fuzz.ratio(zcity, c)) for c in cities), default=np.nan) \
-        if (zcity and cities) else np.nan
+    cs = max((float(fuzz.ratio(zc, c)) for zc in zcities for c in cities),
+             default=np.nan) if (zcities and cities) else np.nan
 
     states = ({ent['state']} if ent['state'] else set()) | \
              (loc['states'] if loc else set())
-    st = (100.0 if zstate in states else 0.0) if (zstate and states) else np.nan
+    st = (100.0 if (set(zstates) & states) else 0.0) \
+        if (zstates and states) else np.nan
 
     zips = ({ent['zip']} if ent['zip'] else set()) | \
            (loc['zips'] if loc else set())
-    zp = (100.0 if zzip in zips else 0.0) if (zzip and zips) else np.nan
+    zp = (100.0 if (set(zzips) & zips) else 0.0) if (zzips and zips) else np.nan
     return nm, an, ab, cs, st, zp, source
 
 
@@ -654,8 +722,12 @@ def cmd_run(cfg, out_prefix, reverse=True):
     else:
         z['DHC_Id_Conflict'] = False
 
-    znames = zc['name'] if isinstance(zc['name'], list) else [zc['name']]
-    zaddr = zc['address'] if isinstance(zc['address'], list) else [zc['address']]
+    # Pooled candidates, normalised once per entity rather than per comparison.
+    z['Z_Cities_N'] = [[_clean(x) for x in v if _clean(x)] for v in z.Z_Cities]
+    z['Z_States_N'] = [sorted({norm_state(x) for x in v} - {''})
+                       for v in z.Z_States]
+    z['Z_Zips_N'] = [sorted({norm_zip5(x) for x in v} - {''})
+                     for v in z.Z_Zips]
 
     # Keep the Definitive name: without it a reviewer cannot see what an id
     # actually points at, which makes the review queue unlabelable.
@@ -685,11 +757,7 @@ def cmd_run(cfg, out_prefix, reverse=True):
                'lines': (r.DHC_Addr1, r.DHC_Addr2), 'city': r.d_city_n,
                'state': r.d_state, 'zip': r.d_zip5}
         rows.append(enriched_scores(
-            [getattr(r, c) for c in znames],
-            [getattr(r, c) for c in zaddr],
-            _clean(getattr(r, zc['city'])),
-            norm_state(getattr(r, zc['state'])),
-            norm_zip5(getattr(r, zc['zip'])),
+            r.Z_Names, r.Z_Addrs, r.Z_Cities_N, r.Z_States_N, r.Z_Zips_N,
             ent, LOC.get(int(r.DHC_Id)) if pd.notna(r.DHC_Id) else None))
 
     for i, c in enumerate(['Name_Score', 'StreetNum_Score', 'StreetName_Score',
@@ -737,6 +805,20 @@ def cmd_run(cfg, out_prefix, reverse=True):
         g['Pct'] = (g.Corroborated / g.Rows).map('{:.1%}'.format)
         print(g.to_string())
 
+    # Populations overlap, so an entity is counted once per population it
+    # belongs to. These rows therefore sum to more than the testable total.
+    print('\n--- By Zeus population (overlapping; entities counted in each) ---')
+    labels = sorted({s for v in sub.Zeus_Sources for s in v.split('|')})
+    print(f'  {"population":16} {"rows":>7} {"corroborated":>13} {"pct":>7}')
+    for lab in labels:
+        m = sub.Zeus_Sources.str.split('|').map(lambda v, l=lab: l in v)
+        n = int(m.sum())
+        ok = int((sub[m].Verdict == 'ID corroborated').sum())
+        print(f'  {lab:16} {n:>7,} {ok:>13,} {ok/max(n,1):>7.1%}')
+    solo = int((sub.Zeus_Source_Count == 1).sum())
+    print(f'  ({solo:,} of {len(sub):,} testable entities belong to exactly '
+          f'one population)')
+
     # ---- reverse lookup on non-corroborated rows ----
     if reverse:
         need = sub[sub.Verdict != 'ID corroborated']
@@ -753,16 +835,20 @@ def cmd_run(cfg, out_prefix, reverse=True):
             return TS_W * ts + TR_W * tr
 
         def pick(r):
-            pool = by_state.get(norm_state(getattr(r, zc['state'])))
+            pool = None
+            for st in r.Z_States_N:            # any population's state will do
+                p = by_state.get(st)
+                if p is not None and len(p):
+                    pool = p if pool is None else pd.concat([pool, p])
             if pool is None or not len(pool):
                 pool = d
             cores, aliases = pool['core'].tolist(), pool['core_alias'].tolist()
-            # Every Zeus name field is an alias of the others, so each one gets
+            # Every pooled Zeus name is an alias of the others, so each one gets
             # to nominate a candidate and the best overall wins - the same rule
             # the forward pass applies via name_score.
             best = None
-            for zn in znames:
-                tgt = name_core(getattr(r, zn)) or _clean(getattr(r, zn))
+            for zn in r.Z_Names:
+                tgt = name_core(zn) or _clean(zn)
                 if not tgt:
                     continue
                 s = np.maximum(blended(tgt, cores), blended(tgt, aliases))
@@ -788,11 +874,8 @@ def cmd_run(cfg, out_prefix, reverse=True):
                    'state': p.d_state, 'zip': p.d_zip5}
             cand_loc = suggest_loc.get(int(p.DHC_Id))
             nm, an, ab, cs, st2, zp, _ = enriched_scores(
-                [getattr(r, c) for c in znames],
-                [getattr(r, c) for c in zaddr],
-                _clean(getattr(r, zc['city'])),
-                norm_state(getattr(r, zc['state'])),
-                norm_zip5(getattr(r, zc['zip'])), ent, cand_loc)
+                r.Z_Names, r.Z_Addrs, r.Z_Cities_N, r.Z_States_N, r.Z_Zips_N,
+                ent, cand_loc)
             recs.append({
                 zc['key']: getattr(r, zc['key']),
                 'Suggested_DHC_Id': int(p.DHC_Id),
@@ -814,16 +897,38 @@ def cmd_run(cfg, out_prefix, reverse=True):
             n = int(sub.Correction_Recommended.sum())
             print(f'Recommended corrections: {n:,}')
 
-    drop = ['d_primary', 'd_aliases', 'd_city_n', 'd_state', 'd_zip5',
-            'core', 'core_alias']
-    detail = sub.drop(columns=[c for c in drop if c in sub.columns])
+    def flatten(df):
+        """List columns are for scoring; a CSV wants readable text."""
+        out = df.copy()
+        out['Zeus_Name'] = [v[0] if v else '' for v in out.Z_Names]
+        out['Zeus_Names_All'] = [' | '.join(v) for v in out.Z_Names]
+        out['Zeus_Address'] = [v[0] if v else '' for v in out.Z_Addrs]
+        out['Zeus_Addresses_All'] = [' | '.join(v) for v in out.Z_Addrs]
+        out['Zeus_City'] = [' | '.join(v) for v in out.Z_Cities]
+        out['Zeus_State'] = [' | '.join(v) for v in out.Z_States]
+        out['Zeus_Zip'] = [' | '.join(str(x) for x in v) for v in out.Z_Zips]
+        return out.drop(columns=[c for c in
+                                 ['Z_Names', 'Z_Addrs', 'Z_Cities', 'Z_States',
+                                  'Z_Zips', 'Z_Cities_N', 'Z_States_N',
+                                  'Z_Zips_N', 'd_primary', 'd_aliases',
+                                  'd_city_n', 'd_state', 'd_zip5', 'core',
+                                  'core_alias'] if c in out.columns])
+
+    lead = ['EntityId', 'Zeus_Sources', 'Zeus_Source_Count', 'Zeus_Name',
+            'Zeus_Names_All', 'Zeus_Address', 'Zeus_Addresses_All',
+            'Zeus_City', 'Zeus_State', 'Zeus_Zip']
+    detail = flatten(sub)
+    detail = detail[[c for c in lead if c in detail.columns] +
+                    [c for c in detail.columns if c not in lead]]
     detail.to_csv(f'{out_prefix}_scored.csv', index=False)
     print(f'\nWrote {out_prefix}_scored.csv  ({len(detail):,} rows)')
 
     unver = zj[~zj.ID_Found]
     if len(unver):
-        cols = [zc['key']] + znames + [zc['city'], zc['state'], 'DHC_Id']
-        unver[[c for c in cols if c in unver.columns]].to_csv(
+        u = flatten(unver)
+        cols = ['EntityId', 'Zeus_Sources', 'Zeus_Name', 'Zeus_Names_All',
+                'Zeus_City', 'Zeus_State', 'DHC_Id', 'DHC_Id_Source']
+        u[[c for c in cols if c in u.columns]].to_csv(
             f'{out_prefix}_unverifiable.csv', index=False)
         print(f'Wrote {out_prefix}_unverifiable.csv  ({len(unver):,} rows)')
     return detail

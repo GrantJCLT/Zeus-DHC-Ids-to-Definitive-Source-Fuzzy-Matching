@@ -8,11 +8,66 @@
 #     python dhc_match_v2.py run --config sources.yaml --out audit_2026_08
 
 zeus:
-  # Zeus is read live from the failover replica. The query defines the
-  # population - note it excludes entities created by a Definitive import
-  # (see the EntityDescription filter), so the row count is NOT the historic
-  # 207,450 and corroboration rates are not comparable to runs before it.
-  query_file: Zeus Client to Definitive ID data quality evaluation.sql
+  # Zeus is read live from the failover replica. Every query excludes entities
+  # created by a Definitive import (the EntityDescription filter), which removes
+  # ~95.6% of identifier-carrying rows - so counts here are NOT comparable to
+  # any run before 2026-07-31.
+  #
+  # SIX populations, one query each, each reading its own *Info table and so its
+  # own column names. 6,902 of 12,810 entities carry more than one flag, e.g.
+  # both IsClient and IsWorkLocation. Those are not duplicates: each Info table
+  # holds a different name and address for the same entity. They are POOLED -
+  # one scored row per EntityId, with every name and address from every
+  # population it belongs to as a candidate, best match wins. `Zeus_Sources`
+  # records which populations contributed.
+  sources:
+    - label: Client
+      query_file: Zeus Client to Definitive ID data quality evaluation.sql
+      name: [ClientEntityName, ClientInfoName]
+      address: [ClientAddress1, ClientAddress2, ClientAddress3]
+      city: ClientCity
+      state: ClientState
+      zip: ClientZip
+
+    - label: WorkLocation
+      query_file: Zeus Work Location to Definitive ID data quality evaluation.sql
+      name: [WorkLocationEntityName, WorkLocationInfoName]
+      address: [WorkLocationAddress1, WorkLocationAddress2, WorkLocationAddress3]
+      city: WorkLocationCity
+      state: WorkLocationState
+      zip: WorkLocationZip
+
+    - label: HealthSystem
+      query_file: Zeus HealthSystem to Definitive ID data quality evaluation.sql
+      name: [HealthSystemEntityName, HealthSystemInfoName]
+      address: [HealthSystemAddress1, HealthSystemAddress2, HealthSystemAddress3]
+      city: HealthSystemCity
+      state: HealthSystemState
+      zip: HealthSystemZip
+
+    - label: GPO
+      query_file: Zeus GPO to Definitive ID data quality evaluation.sql
+      name: [GPOEntityName, GPOInfoName]
+      address: [GPOAddress1, GPOAddress2, GPOAddress3]
+      city: GPOCity
+      state: GPOState
+      zip: GPOZip
+
+    - label: Agency
+      query_file: Zeus Agency to Definitive ID data quality evaluation.sql
+      name: [AgencyEntityName, AgencyName]
+      address: [AgencyAddress1, AgencyAddress2, AgencyAddress3]
+      city: AgencyCity
+      state: AgencyState
+      zip: AgencyZip
+
+    - label: VMS
+      query_file: Zeus VMS to Definitive ID data quality evaluation.sql
+      name: [VMSEntityName, VMSInfoName]
+      address: [VMSAddress1, VMSAddress2, VMSAddress3]
+      city: VMSCity
+      state: VMSState
+      zip: VMSZip
 
   connection:
     driver: ODBC Driver 18 for SQL Server
@@ -29,31 +84,18 @@ zeus:
     application_intent: ReadOnly
     multi_subnet_failover: true
 
-  # A file can still be used instead of `query_file` - an archived extract,
-  # or an offline re-run. Set `path:` and the connection block is ignored.
-  # path: zeus_extract.csv
+  # An archived extract can replace the live queries for an offline re-run.
+  # Point `path:` at a <prefix>_zeus_extract.csv - it holds the canonical union
+  # (one row per population per entity) and is pooled the same way on load.
+  # path: audit_2026_08_zeus_extract.csv
 
-  key: EntityId                     # unique Zeus row key
+  key: EntityId                     # one scored row per EntityId after pooling
   # Tried in order; the first non-null wins. Where both are populated and
-  # disagree the row is flagged in DHC_Id_Conflict.
+  # disagree the row is flagged in DHC_Id_Conflict. Both live on dbo.Entity /
+  # LinkEntityVerifiedSource, so they are the same for every population.
   id_columns:
     - Entity_DHC_VerifiedSourceId
     - LEVS_DHC_VerifiedSourceId
-  # Zeus's two name fields are ALIASES of one another, not a primary plus a
-  # fallback. Every one is scored against the Definitive side and the best match
-  # wins, in both the forward pass and the reverse lookup.
-  # `ClientEntityName` is `e.Name` in the query (it was `EntityName` before
-  # 2026-07-31); `ClientInfoName` is `ci.ClientInfoName`.
-  name:
-    - ClientEntityName
-    - ClientInfoName
-  address:                          # the street line is not always the first
-    - ClientAddress1
-    - ClientAddress2
-    - ClientAddress3
-  city: ClientCity
-  state: ClientState                # full names or codes both fine
-  zip: ClientZip
 
 # ---------------------------------------------------------------------------
 # IDENTITY sources: one row per Definitive entity. These decide what an id IS.

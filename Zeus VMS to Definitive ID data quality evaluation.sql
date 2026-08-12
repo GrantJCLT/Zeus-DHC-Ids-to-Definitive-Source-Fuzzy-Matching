@@ -10,7 +10,7 @@
           ,cia.Address3 AS VMSAddress3
           ,cia.City AS VMSCity
           ,cia.Zip AS VMSZip
-          ,ciast.StateName AS WorkLocationState
+          ,ciast.StateName AS VMSState
           --,COUNT(DISTINCT e.EntityId) AS theCount
           --,e.VerifiedSourceNameId AS entityVerifSourceNameId
           ,e.VerifiedSourceId AS Entity_DHC_VerifiedSourceId

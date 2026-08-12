@@ -26,9 +26,11 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   [--baseline <earlier>_scored.csv] --out <name>.xlsx`
 - `sources.yaml` — column-role and connection config. **This is the only file to
   edit when a new Definitive export arrives.**
-- `Zeus Client to Definitive ID data quality evaluation.sql` — **the Zeus
-  extract definition.** Read live against the database; there is no longer a
-  Zeus workbook.
+- **Six Zeus queries**, `Zeus <X> to Definitive ID data quality evaluation.sql`
+  for X in Client, Work Location, HealthSystem, GPO, Agency, VMS. Read live;
+  there is no longer a Zeus workbook. Each reads its own `*Info` table and so
+  its own column names, mapped to roles per-population under `zeus.sources`.
+  See decision #10 for why they are pooled rather than stacked.
 - **Identity exports** — one row per Definitive entity, all keyed `DefinitiveId`:
   `Definitive_HospitalOverview.xlsx` (9,870),
   `Definitive_PhysicianGroupOverview.xlsx` (138,385),
@@ -60,6 +62,51 @@ py dhc_match_v2.py inspect <NewDefinitiveExport.xlsx>
 py dhc_match_v2.py run --config sources.yaml --out audit_2026_08 [--no-reverse]
 py dhc_match_v2.py run --config sources.yaml --zeus <archived_extract.csv> ...
 ```
+
+## Producing a new audit summary
+
+Two commands. Set `TAG` to the run you want (`2026_09`, say) and `PREV` to the
+previous run's scored csv, which drives the like-for-like comparison.
+
+```
+py dhc_match_v2.py run --config sources.yaml --out audit_<TAG>
+
+py build_audit_workbook.py --scored audit_<TAG>_scored.csv --config sources.yaml \
+    --baseline audit_<PREV>_scored.csv --out Zeus_DHC_ID_Accuracy_Audit_<TAG>.xlsx
+```
+
+Step 1 writes `audit_<TAG>_scored.csv`, `_unverifiable.csv` and
+`_zeus_extract.csv`; step 2 turns them into the branded workbook. Roughly two to
+three minutes end to end, most of it reading the 400k-row location export.
+
+Preconditions — all currently satisfied:
+
+- `ZEUS_SQL_PASSWORD` set at User scope. If it is missing the run stops
+  immediately and names the variable.
+- The four `Definitive_*.xlsx` exports present in the working directory.
+- `pyodbc` plus ODBC Driver 17 or 18 installed.
+
+Check four things in the step-1 output before circulating anything:
+
+1. `connected to a READ_ONLY database`. Anything else means the ReadOnly intent
+   is not being honoured — stop.
+2. No `NOTE: ±N vs the expected …` line, or a small explicable one. A large jump
+   means the Zeus population moved; find out why before quoting a rate, then
+   update `ZEUS_BASELINE_ENTITIES`.
+3. Each of the six populations reports a plausible row count. A population
+   dropping to zero means a query or a column was renamed.
+4. In the workbook: testable + unverifiable = supplied, and the verdict counts
+   sum to testable. Those two identities catch most wiring mistakes.
+
+**Keep `audit_<TAG>_zeus_extract.csv` with anything you circulate.** Zeus is a
+live moving target and the snapshot is the only way to reproduce a figure later.
+Verified: replaying it with `--zeus` reproduces the run exactly.
+
+When a **new Definitive export** arrives, run `inspect` on it and update
+`sources.yaml` — under `definitive:` for an identity export, or `locations:` if
+it has many rows per id (decision #9). When a **new Zeus population** is added,
+add a block under `zeus.sources` with that query's own column names; nothing
+else needs to change (decision #10).
 
 Every run writes `<out>_zeus_extract.csv`, a snapshot of the exact input it
 scored. Zeus is a live moving target and these snapshots are **not** in git (see
@@ -100,19 +147,42 @@ Two consequences worth knowing:
 
 ## Results
 
-All four Definitive sources, 2026-07-31 (`audit_2026_08_all4_*`). Zeus
-population 9,171 rows; 7,666 testable (83.6%); 202,586 reference records.
+Six Zeus populations against all four Definitive sources, 2026-08-12
+(`audit_2026_08_all6_*`). 19,820 population rows pooled to **12,803 distinct
+entities**; 11,099 testable (86.7%); 202,586 reference records.
 
-| Entity type | Rows | Corroborated |
+| Definitive entity type | Rows | Corroborated |
 |---|---|---|
-| Hospital | 5,504 | 5,397 (98.1%) |
-| PhysicianGroup | 2,155 | 2,055 (95.4%) |
-| GPO | 4 | 3 |
-| PracticeLocation (location-only ids) | 3 | 0 |
+| Hospital | 8,612 | 8,419 (97.8%) |
+| PhysicianGroup | 2,478 | 2,317 (93.5%) |
+| GPO | 5 | 4 |
+| PracticeLocation (location-only ids) | 4 | 0 |
 
-Whole testable population: 97.2% corroborated, 99.0% corroborated-or-probable,
-17 likely-wrong (0.2%), 61 needs-review, 466 `Address_Divergent`,
-17 `Geo_Conflict`, 28 recommended corrections, 1,505 unverifiable.
+| Zeus population | Testable | Corroborated |
+|---|---|---|
+| WorkLocation | 9,229 | 8,953 (97.0%) |
+| Client | 7,666 | 7,470 (97.4%) |
+| HealthSystem | 578 | 556 (96.2%) |
+| GPO | 1 | 0 |
+| Agency | 1 | 1 |
+| VMS | 0 | — (its one entity is unverifiable) |
+
+Populations overlap, so those rows sum to more than 11,099; only 4,881 of the
+11,099 testable entities belong to exactly one population.
+
+Whole testable population: 96.8% corroborated, 98.8% corroborated-or-probable,
+19 likely-wrong (0.2%), 116 needs-review, 579 `Address_Divergent`,
+27 `Geo_Conflict`, 33 recommended corrections, 1,704 unverifiable.
+
+**Pooling paid off and cost nothing.** On the 7,666 Client entities scored both
+before and after the other five populations were added: 33 name scores and 241
+address scores improved, 15 verdicts moved up to `ID corroborated`, and **no
+verdict regressed**. Client corroboration went 97.2% → 97.4% on an identical
+row set.
+
+**Earlier single-population figures**, for reference only — the denominators
+differ, so these are not a trend: Client-only with all four Definitive sources
+was 7,666 testable at 97.2%; Client-only HQ-only was 7,659 at 96.8%.
 
 **What the service-location data bought**, measured against the identical 7,659
 rows scored HQ-only earlier the same day:
@@ -210,6 +280,20 @@ naive alternative was measurably wrong.
    candidate address, city, state, zip and name alias to its parent. This is
    what finally addressed the HQ-versus-service-location gap that decision #4
    exists to work around.
+
+10. **Zeus populations are pooled by `EntityId`, not stacked.** 6,855 of 12,803
+    entities carry more than one flag (commonly `IsClient` *and*
+    `IsWorkLocation`), and each `*Info` table holds a *different* name and
+    address for the same entity. Stacked, an entity would be scored several
+    times and the headline denominator would double-count it. Pooled, all its
+    names and addresses become candidates and the best match wins — one verdict
+    per entity, `Zeus_Sources` recording which populations contributed. Measured
+    on the Client subset: 15 verdicts improved, none regressed. The per-
+    population breakdown counts an entity once per population it belongs to, so
+    those rows deliberately sum to more than the total; say so whenever it is
+    quoted. A useful side effect is that junk names are harmless — `name_score`
+    takes a maximum, so `DO NOT USE - Banner Health` sitting alongside
+    `Banner Health` cannot lower a score.
 
 ## Reporting template
 
@@ -337,9 +421,13 @@ variants (`Southpoint Anesthesia LLC` → `Southpoint Anesthesia Services LLC`;
   17 of the 77 values are 10-digit NPI-shaped numbers — Definitive hospital IDs
   top out at 7 digits, so those cannot be valid. Recommend fixing or retiring
   the column.
-- 655 IDs are shared by more than one Zeus entity (1,562 rows). Mostly several
-  Zeus records for one real facility, e.g. separate contracts. Not an error in
-  itself — do not treat as a defect without checking.
+- **Shared DHC ids grew a lot with six populations: 4,834 scored rows carry an
+  id claimed by another entity.** A client entity and a work-location entity are
+  *different* `EntityId`s that legitimately point at the same Definitive record,
+  and pooling does not merge them because pooling is keyed on `EntityId`. Mostly
+  not an error — do not treat as a defect without checking. Merging by DHC id
+  instead would be a different audit (is the id right?) from the one this tool
+  performs (does each Zeus record point at the right thing?).
 - Definitive uses **one ID namespace across entity types**. Zeus IDs of ≤4
   digits match the hospital extract 99.7%+ of the time; 6–7 digit IDs match only
   1–2.7%. 200,417 Zeus rows (96.6%) carry 6–7 digit IDs, which are almost

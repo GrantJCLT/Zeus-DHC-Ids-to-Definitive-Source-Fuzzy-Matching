@@ -97,7 +97,7 @@ def sheet_data(wb, title, df, widths=None):
     return ws
 
 
-def build_summary(wb, s, funnel, verdicts, by_type, gains, subtitle):
+def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle):
     ws = wb.create_sheet('Summary')
     for col, w in zip('ABCDE', (4, 62, 16, 14, 60)):
         ws.column_dimensions[col].width = w
@@ -113,14 +113,14 @@ def build_summary(wb, s, funnel, verdicts, by_type, gains, subtitle):
     total = funnel['testable']
     corr = verdicts.get('ID corroborated', 0)
     _put(ws, 'B5',
-         f'Of the {total:,} Zeus client records whose DHC identifier can '
-         f'actually be tested against a Definitive record, {corr:,} '
-         f'({corr / total:.1%}) are corroborated by name and address, and '
+         f'Of the {total:,} Zeus entities whose DHC identifier can actually be '
+         f'tested against a Definitive record, {corr:,} ({corr / total:.1%}) '
+         f'are corroborated by name and address, and '
          f'{funnel["corr_or_prob"]:,} ({funnel["corr_or_prob"] / total:.1%}) '
          f'are corroborated or probable. {verdicts.get("Likely wrong ID", 0):,} '
          f'look like the wrong identifier. This is a measure of the '
-         f'{total:,}-row testable population, not of all {funnel["zeus"]:,} '
-         f'Zeus client rows - see the population funnel below.',
+         f'{total:,} testable entities, not of all {funnel["zeus"]:,} Zeus '
+         f'entities carrying an identifier - see the population funnel below.',
          BODY, FILL_CREAM, align=WRAP)
 
     r = 9
@@ -145,11 +145,24 @@ def build_summary(wb, s, funnel, verdicts, by_type, gains, subtitle):
     r = _table(ws, r + 1, ['Entity type', 'Rows', 'Corroborated', 'Share'],
                by_type)
 
-    _put(ws, f'B{r}', '4. What the service-location data contributed', SECTION)
-    _put(ws, f'B{r + 1}', 'Definitive_Practice_Locations supplies each entity\'s '
-                          'service locations, so a Zeus address is compared '
-                          'against every known site rather than the HQ alone.',
-         NOTE)
+    if by_pop:
+        _put(ws, f'B{r}', '4. By Zeus population', SECTION)
+        _put(ws, f'B{r + 1}', 'Populations overlap - an entity that is both a '
+                              'client and a work location is counted in each, '
+                              'so these rows sum to more than the testable '
+                              'total. Its names and addresses from every '
+                              'population are pooled into one verdict.', NOTE)
+        r = _table(ws, r + 2,
+                   ['Zeus population', 'Testable', 'Corroborated', 'Share'],
+                   by_pop)
+
+    _put(ws, f'B{r}', '5. What the enrichment contributed', SECTION)
+    _put(ws, f'B{r + 1}', 'Two changes since the baseline run, so this delta is '
+                          'their combined effect: Definitive service locations '
+                          'mean a Zeus address is compared against every known '
+                          'site rather than the HQ alone, and pooling means an '
+                          'entity is compared using its name and address from '
+                          'every Zeus population it belongs to.', NOTE)
     r = _table(ws, r + 2, ['Measure', 'HQ only', 'With locations', 'Reading'],
                gains, notes_col=3)
     return ws
@@ -187,7 +200,11 @@ def main():
     u = pd.read_csv(unver, low_memory=False) if os.path.exists(unver) else None
 
     cfg = load_config(a.config)
-    zeus_rows = len(z) if z is not None else len(s) + (len(u) if u is not None else 0)
+    # The extract holds one row per population per entity; the audit's grain is
+    # the entity, so the funnel must count distinct EntityIds, not extract rows.
+    zeus_rows = (int(z.EntityId.nunique()) if z is not None and 'EntityId' in z
+                 else len(s) + (len(u) if u is not None else 0))
+    pop_rows = len(z) if z is not None else None
     testable = len(s)
     ident_ids = set()
     for b in cfg['definitive']:
@@ -212,7 +229,9 @@ def main():
             if c in z.columns:
                 f = _too_wide(z[c]).reindex(z.index, fill_value=False)
                 flags = f if flags is None else (flags | f)
-        implausible = int(flags.sum()) if flags is not None else 0
+        if flags is not None:
+            # One row per population per entity - count each entity once.
+            implausible = int(z.assign(_f=flags).groupby('EntityId')._f.any().sum())
 
     vc = s.Verdict.value_counts().to_dict()
     corr_or_prob = int(s.Verdict.str.startswith(('ID corroborated',
@@ -220,8 +239,11 @@ def main():
     funnel = {
         'zeus': zeus_rows, 'testable': testable, 'corr_or_prob': corr_or_prob,
         'rows': [
-            ['Zeus client records supplied', zeus_rows, 1.0,
-             'Row grain: one per EntityId. Live query, default address only.'],
+            ['Zeus entities supplied', zeus_rows, 1.0,
+             f'Row grain: one per EntityId. Pooled from '
+             f'{pop_rows:,} population rows across six queries; an entity in '
+             f'several populations is counted once.' if pop_rows else
+             'Row grain: one per EntityId.'],
             ['DHC identifier populated', int(allids.notna().sum()),
              float(allids.notna().sum()) / zeus_rows,
              'Entity_DHC_VerifiedSourceId, falling back to '
@@ -263,44 +285,69 @@ def main():
     by_type = [[i, int(r.Rows), int(r.Corroborated), r.Corroborated / r.Rows]
                for i, r in g.iterrows()]
 
+    by_pop = []
+    if 'Zeus_Sources' in s.columns:
+        labels = sorted({x for v in s.Zeus_Sources.dropna()
+                         for x in str(v).split('|')})
+        for lab in labels:
+            m = s.Zeus_Sources.fillna('').str.split('|').map(
+                lambda v, l=lab: l in v)
+            n_ = int(m.sum())
+            ok = int((s[m].Verdict == 'ID corroborated').sum())
+            by_pop.append([lab, n_, ok, ok / n_ if n_ else 0.0])
+
     gains = []
     if a.baseline and os.path.exists(a.baseline):
         b = pd.read_csv(a.baseline, low_memory=False)
-        j = b[['EntityId', 'Address_Score', 'Verdict']].merge(
-            s[['EntityId', 'Address_Score', 'Verdict']], on='EntityId',
-            suffixes=('_hq', '_loc'))
-        bc = int((b.Verdict == 'ID corroborated').sum())
+        # Restricted to entities present in BOTH runs. The baseline predates the
+        # extra Zeus populations, so comparing full totals would credit the
+        # location data with a population increase it had nothing to do with.
+        keep = set(b.EntityId) & set(s.EntityId)
+        bb, ss = b[b.EntityId.isin(keep)], s[s.EntityId.isin(keep)]
+        note = f'Like-for-like on the {len(keep):,} entities in both runs.'
+
+        def pair(label, bser, sser, reading):
+            return [label, int(bser.sum()), int(sser.sum()), reading]
+
         gains = [
-            ['Corroborated', bc, int(vc.get('ID corroborated', 0)),
-             f'On the {len(j):,} rows common to both runs.'],
-            ['Address divergent (corroborated, addr<60)',
-             int(((b.Verdict == 'ID corroborated') &
-                  (b.Address_Score < 60)).sum()),
-             int(s.Address_Divergent.sum()) if 'Address_Divergent' in s else 0,
-             'Zeus address matches neither HQ nor any known site.'],
-            ['Geo conflict', int(b.Geo_Conflict.sum())
-             if 'Geo_Conflict' in b else 0,
-             int(s.Geo_Conflict.sum()) if 'Geo_Conflict' in s else 0,
-             'Now means no known location is in the Zeus state.'],
-            ['Rows whose address matched a satellite, not HQ', 0,
-             int((s.Address_Match_Source == 'Location').sum())
-             if 'Address_Match_Source' in s else 0,
-             'Impossible before locations were available.'],
+            pair('Corroborated', bb.Verdict == 'ID corroborated',
+                 ss.Verdict == 'ID corroborated', note),
+            pair('Address divergent (corroborated, addr<60)',
+                 (bb.Verdict == 'ID corroborated') & (bb.Address_Score < 60),
+                 (ss.Verdict == 'ID corroborated') & (ss.Address_Score < 60),
+                 'Zeus address matches neither HQ nor any known site.'),
+            pair('Geo conflict',
+                 bb.Geo_Conflict if 'Geo_Conflict' in bb else pd.Series(dtype=bool),
+                 ss.Geo_Conflict if 'Geo_Conflict' in ss else pd.Series(dtype=bool),
+                 'Now means no known location is in the Zeus state.'),
+            pair('Address matched a satellite, not HQ',
+                 pd.Series([False] * len(bb)),
+                 ss.Address_Match_Source == 'Location'
+                 if 'Address_Match_Source' in ss else pd.Series([False] * len(ss)),
+                 'Impossible before service locations were available.'),
         ]
 
-    subtitle = ('Zeus client records vs. Definitive Hospital, Physician Group, '
+    subtitle = ('Six Zeus populations (Client, Work Location, Health System, '
+                'GPO, Agency, VMS) vs. Definitive Hospital, Physician Group, '
                 'GPO and Practice Location exports  |  read live from the '
                 'read-only replica')
 
     wb = Workbook()
     wb.remove(wb.active)
-    build_summary(wb, s, funnel, verdicts, by_type, gains, subtitle)
+    build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle)
     build_methodology(wb, [
         ('Source of truth', 'Zeus is read live from the failover replica with '
          'ApplicationIntent=ReadOnly; the run asserts the database is '
          'READ_ONLY. Every run snapshots its exact input to '
          '<out>_zeus_extract.csv.'),
-        ('Population', 'The query returns non-archived client entities '
+        ('Six populations, pooled', 'Zeus is read through six queries - '
+         'IsClient, IsWorkLocation, IsHealthSystem, IsGPO, IsAgency, IsVMS - '
+         'each reading its own *Info table and so its own column names. 6,855 '
+         'of 12,803 entities appear in more than one, holding a different name '
+         'and address in each. Neither is authoritative, so all of them become '
+         'candidates and the best match wins: one verdict per entity, no double '
+         'counting. Zeus_Sources records which populations contributed.'),
+        ('Population', 'The queries return non-archived entities '
          'carrying a DHC identifier, and EXCLUDES entities created by a '
          'Definitive import. That exclusion removes 95.6% of identifier-'
          'carrying rows, whose identifiers are near self-referential. Figures '
@@ -344,9 +391,9 @@ def main():
          'human or a third identifier such as NPI.'),
     ])
 
-    show = [c for c in ['EntityId', 'ClientEntityName', 'ClientInfoName',
-                        'ClientAddress1', 'ClientCity', 'ClientState',
-                        'ClientZip', 'DHC_Id', 'DHC_Matched_Name',
+    show = [c for c in ['EntityId', 'Zeus_Sources', 'Zeus_Name',
+                        'Zeus_Names_All', 'Zeus_Address', 'Zeus_City',
+                        'Zeus_State', 'Zeus_Zip', 'DHC_Id', 'DHC_Matched_Name',
                         'DHC_Entity_Type', 'DHC_City', 'DHC_State',
                         'Name_Score', 'Address_Score', 'State_Score',
                         'Address_Match_Source', 'Location_Count', 'Verdict',
@@ -372,8 +419,9 @@ def main():
 
     if 'DHC_Id_Conflict' in s.columns:
         cf = s[s.DHC_Id_Conflict.fillna(False).astype(bool)]
-        cols = [c for c in ['EntityId', 'ClientEntityName', 'ClientCity',
-                            'ClientState', 'Entity_DHC_VerifiedSourceId',
+        cols = [c for c in ['EntityId', 'Zeus_Sources', 'Zeus_Name',
+                            'Zeus_City', 'Zeus_State',
+                            'Entity_DHC_VerifiedSourceId',
                             'LEVS_DHC_VerifiedSourceId', 'DHC_Id',
                             'DHC_Matched_Name', 'Verdict'] if c in s.columns]
         sheet_data(wb, 'ID_Conflicts', cf[cols])
