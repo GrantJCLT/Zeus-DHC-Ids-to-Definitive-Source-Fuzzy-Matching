@@ -65,15 +65,18 @@ py dhc_match_v2.py run --config sources.yaml --zeus <archived_extract.csv> ...
 
 ## Producing a new audit summary
 
-Two commands. Set `TAG` to the run you want (`2026_09`, say) and `PREV` to the
-previous run's scored csv, which drives the like-for-like comparison.
+Two commands. Set `TAG` to the run date, `YYYY_MM_DD`.
 
 ```
 py dhc_match_v2.py run --config sources.yaml --out audit_<TAG>
 
 py build_audit_workbook.py --scored audit_<TAG>_scored.csv --config sources.yaml \
-    --baseline audit_<PREV>_scored.csv --out Zeus_DHC_ID_Accuracy_Audit_<TAG>.xlsx
+    --out Zeus_DHC_ID_Accuracy_Audit_<TAG>.xlsx
 ```
+
+`--baseline <earlier>_scored.csv` is **optional**: it adds a section comparing
+this run against an earlier one on the entities common to both. Omit it and that
+section is left out entirely; nothing else changes.
 
 Step 1 writes `audit_<TAG>_scored.csv`, `_unverifiable.csv` and
 `_zeus_extract.csv`; step 2 turns them into the branded workbook. Roughly two to
@@ -151,6 +154,24 @@ Six Zeus populations against all four Definitive sources, 2026-08-12
 (`audit_2026_08_all6_*`). 19,820 population rows pooled to **12,803 distinct
 entities**; 11,099 testable (86.7%); 202,586 reference records.
 
+**The headline is now stated over the whole population**, not just the testable
+part. Decision #1's warning was written when the hospitals-only export left 95%
+unverifiable; at 13.3% that framing hid more than it protected. Both denominators
+are given, and the untestable remainder is a row rather than an omission:
+
+| Of 12,803 Zeus objects carrying a Definitive identifier | | |
+|---|---|---|
+| Confirmed — points at the right record | 10,740 | 83.9% |
+| Probably right | 224 | 1.7% |
+| Needs review | 116 | 0.9% |
+| Likely wrong identifier | 19 | 0.1% |
+| Cannot be tested — id in no Definitive export | 1,704 | 13.3% |
+
+Those five rows sum to 12,803. Of the 11,099 that can be tested, 96.8% are
+confirmed and 98.8% confirmed-or-probable — still the right figure for "of the
+ones we can check", and the one the per-population and per-entity-type tables
+below use.
+
 | Definitive entity type | Rows | Corroborated |
 |---|---|---|
 | Hospital | 8,612 | 8,419 (97.8%) |
@@ -217,10 +238,15 @@ regenerated.
 These were derived empirically against this data. Each one exists because the
 naive alternative was measurably wrong.
 
-1. **Never quote an accuracy rate against all 207,450 rows.** The Definitive
-   extract is hospitals only. An ID absent from it is *unverifiable*, not wrong.
-   Quoting 4.6% as an accuracy figure measures the scope of the export, not the
-   quality of Zeus. Always state the denominator.
+1. **Always state the denominator, and state both.** An ID absent from the
+   reference set is *unverifiable*, not wrong — the original form of this rule
+   forbade quoting against the full population, because the hospitals-only
+   export made 95% of rows untestable and "4.6% accurate" measured the export's
+   scope rather than Zeus. With all four Definitive sources only 13.3% are
+   untestable, so the honest headline now reports the whole population *with the
+   untestable share shown as its own line*, alongside the testable-only rate.
+   What is still forbidden is quoting one rate without saying which denominator
+   it uses.
 
 2. **Parse `(FKA ...)` aliases out of Definitive names and score against them.**
    3,046 of 9,870 hospital names (31%) carry a parenthetical former name. Without
@@ -323,10 +349,18 @@ three changes to the hand-built original:
 - The original stored the `ID_Conflicts` flag as the literal formula `=TRUE()`;
   the generator writes real values.
 
-Latest deliverable: `Zeus_DHC_ID_Accuracy_Audit_2026_08.xlsx`. The funnel
-reconciles (testable + unverifiable = supplied) and the verdict counts sum to
-the testable population — worth re-checking after any change, since those two
-identities catch most wiring mistakes.
+Latest deliverable: **`Zeus_DHC_ID_Accuracy_Audit_2026_08_12.xlsx`**, from the
+2026-08-12 six-population run. Name deliverables with the **run date**
+(`_YYYY_MM_DD`), not the month — Zeus is live, so two runs in one month are
+different populations and a month-only name silently overwrites one with the
+other.
+
+Three identities should hold, and re-checking them after any change catches most
+wiring mistakes:
+
+- the five outcome rows sum to the supplied population (12,803);
+- testable + unverifiable = supplied;
+- the verdict counts sum to the testable population.
 
 ## How `name_core` behaves on practices
 

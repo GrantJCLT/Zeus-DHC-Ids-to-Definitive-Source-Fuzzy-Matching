@@ -97,7 +97,8 @@ def sheet_data(wb, title, df, widths=None):
     return ws
 
 
-def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle):
+def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle,
+                  overall):
     ws = wb.create_sheet('Summary')
     for col, w in zip('ABCDE', (4, 62, 16, 14, 60)):
         ws.column_dimensions[col].width = w
@@ -111,25 +112,41 @@ def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle):
     _put(ws, 'B4', 'Headline answer', SECTION)
     ws.merge_cells('B5:E7')
     total = funnel['testable']
+    zeus = funnel['zeus']
     corr = verdicts.get('ID corroborated', 0)
     _put(ws, 'B5',
-         f'Of the {total:,} Zeus entities whose DHC identifier can actually be '
-         f'tested against a Definitive record, {corr:,} ({corr / total:.1%}) '
-         f'are corroborated by name and address, and '
-         f'{funnel["corr_or_prob"]:,} ({funnel["corr_or_prob"] / total:.1%}) '
-         f'are corroborated or probable. {verdicts.get("Likely wrong ID", 0):,} '
-         f'look like the wrong identifier. This is a measure of the '
-         f'{total:,} testable entities, not of all {funnel["zeus"]:,} Zeus '
-         f'entities carrying an identifier - see the population funnel below.',
+         f'Zeus holds {zeus:,} distinct objects carrying a Definitive '
+         f'identifier. {corr:,} of them ({corr / zeus:.1%}) are confirmed to '
+         f'point at the right Definitive record, matched on name and address; a '
+         f'further {overall["probable"]:,} ({overall["probable"] / zeus:.1%}) '
+         f'probably do. {overall["review"]:,} need a human look and '
+         f'{overall["wrong"]:,} look like the wrong identifier. The remaining '
+         f'{overall["untestable"]:,} ({overall["untestable"] / zeus:.1%}) cannot '
+         f'be judged either way: their identifier is not present in any '
+         f'Definitive export supplied, which makes them unverifiable rather '
+         f'than wrong. Of the {total:,} that CAN be tested, {corr / total:.1%} '
+         f'are confirmed and {funnel["corr_or_prob"] / total:.1%} are confirmed '
+         f'or probable.',
          BODY, FILL_CREAM, align=WRAP)
 
     r = 9
+    _put(ws, f'B{r}', 'Accuracy across every Zeus object carrying an identifier',
+         SECTION)
+    _put(ws, f'B{r + 1}',
+         'The direct answer to "how accurate are our Definitive identifiers". '
+         'Denominator is every object with an identifier, so the untestable '
+         'remainder is visible rather than excluded.', NOTE)
+    r = _table(ws, r + 2, ['Outcome', 'Objects', 'Share', 'Reading'],
+               overall['rows'], notes_col=3)
+
     _put(ws, f'B{r}', '1. Population funnel', SECTION)
-    r = _table(ws, r + 1, ['Measure', 'Rows', '% of Zeus', 'Reading'],
+    head = r + 1
+    r = _table(ws, head, ['Measure', 'Rows', '% of Zeus', 'Reading'],
                funnel['rows'], notes_col=3)
-    # shade the supplied-input row, as the template does
+    # shade the supplied-input row, as the template does - keyed off the header
+    # row rather than a fixed row number, so inserting sections above is safe
     for col in 'BCDE':
-        ws[f'{col}11'].fill = FILL_LILAC
+        ws[f'{col}{head + 1}'].fill = FILL_LILAC
     _put(ws, f'B{r}', 'Shaded row is a direct input from the query. All other '
                       'counts are derived.', NOTE)
 
@@ -156,15 +173,20 @@ def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle):
                    ['Zeus population', 'Testable', 'Corroborated', 'Share'],
                    by_pop)
 
-    _put(ws, f'B{r}', '5. What the enrichment contributed', SECTION)
-    _put(ws, f'B{r + 1}', 'Two changes since the baseline run, so this delta is '
-                          'their combined effect: Definitive service locations '
-                          'mean a Zeus address is compared against every known '
-                          'site rather than the HQ alone, and pooling means an '
-                          'entity is compared using its name and address from '
-                          'every Zeus population it belongs to.', NOTE)
-    r = _table(ws, r + 2, ['Measure', 'HQ only', 'With locations', 'Reading'],
-               gains, notes_col=3)
+    # Only when a --baseline was supplied. Without one there is nothing to
+    # compare, and an empty table under a heading reads like missing data.
+    if gains:
+        _put(ws, f'B{r}', '5. What the enrichment contributed', SECTION)
+        _put(ws, f'B{r + 1}', 'Two changes since the baseline run, so this delta '
+                              'is their combined effect: Definitive service '
+                              'locations mean a Zeus address is compared against '
+                              'every known site rather than the HQ alone, and '
+                              'pooling means an entity is compared using its '
+                              'name and address from every Zeus population it '
+                              'belongs to.', NOTE)
+        r = _table(ws, r + 2,
+                   ['Measure', 'Baseline run', 'This run', 'Reading'],
+                   gains, notes_col=3)
     return ws
 
 
@@ -285,6 +307,31 @@ def main():
     by_type = [[i, int(r.Rows), int(r.Corroborated), r.Corroborated / r.Rows]
                for i, r in g.iterrows()]
 
+    # The direct answer: outcomes over EVERY object carrying an identifier, so
+    # the untestable remainder is stated rather than excluded from the rate.
+    untestable = zeus_rows - testable
+    probable = int(s.Verdict.str.startswith('Probable').sum())
+    review = int((s.Verdict == 'Needs review').sum())
+    wrong = int((s.Verdict == 'Likely wrong ID').sum())
+    confirmed = int(vc.get('ID corroborated', 0))
+    overall = {
+        'probable': probable, 'review': review, 'wrong': wrong,
+        'untestable': untestable,
+        'rows': [
+            ['Confirmed - points at the right record', confirmed,
+             confirmed / zeus_rows,
+             'Name agrees, and the address matches the HQ or a known site.'],
+            ['Probably right', probable, probable / zeus_rows,
+             'One of name or address agrees strongly, the other does not.'],
+            ['Needs review', review, review / zeus_rows,
+             'Neither side is convincing. Human judgement needed.'],
+            ['Likely wrong identifier', wrong, wrong / zeus_rows,
+             'Strong signal the identifier points at something else.'],
+            ['Cannot be tested', untestable, untestable / zeus_rows,
+             'Identifier is in no Definitive export supplied - unverifiable, '
+             'not wrong. See Unreferenced_Definitive for the reverse view.'],
+        ]}
+
     by_pop = []
     if 'Zeus_Sources' in s.columns:
         labels = sorted({x for v in s.Zeus_Sources.dropna()
@@ -334,7 +381,8 @@ def main():
 
     wb = Workbook()
     wb.remove(wb.active)
-    build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle)
+    build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle,
+                  overall)
     build_methodology(wb, [
         ('Source of truth', 'Zeus is read live from the failover replica with '
          'ApplicationIntent=ReadOnly; the run asserts the database is '
