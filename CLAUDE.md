@@ -2,11 +2,30 @@
 
 ## What this project does
 
-Measures how often the third-party Definitive Healthcare (DHC) IDs stored in Zeus
-(Jackson and Coker's internal CRM) actually point at the right Definitive record.
-Verification is by fuzzy comparison of name and address between the two sides —
-there is no authoritative key to check against, so the output is a confidence
-score and a verdict per row, not a boolean.
+Two questions about the same link, over one universe of Zeus entities:
+
+- **Accuracy** — of the entities that carry a Definitive Healthcare (DHC) ID,
+  how often does it point at the right Definitive record? `dhc_match_v2.py`.
+- **Coverage** — which entities carry no DHC ID at all, and which Definitive
+  record should each of them point at? `dhc_gap_match.py`, added 2026-08-19.
+
+Zeus is Jackson and Coker's internal CRM. Verification is by fuzzy comparison of
+name and address between the two sides — there is no authoritative key to check
+against, so the output is a confidence score and a verdict (accuracy) or a tier
+(coverage) per row, not a boolean.
+
+The two populations **partition** one universe and are defined by complementary
+SQL predicates, so their counts add up:
+
+| | Entities | |
+|---|---|---|
+| Carry a DHC ID — measured for accuracy | 12,803 | 20.8% |
+| Carry none — measured for coverage | 48,739 | 79.2% |
+| **Total Zeus entities across the six populations** | **61,542** | |
+
+Coverage is the larger problem by a factor of four, and was invisible until
+2026-08-19 because every query in the project until then selected only rows that
+already had an ID.
 
 Owner: Grant, analytics / BI engineering. Stack context: Zeus is Azure SQL;
 the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
@@ -24,13 +43,32 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   Everything in it is derived from the run, so it is re-runnable:
   `py build_audit_workbook.py --scored <prefix>_scored.csv --config sources.yaml
   [--baseline <earlier>_scored.csv] --out <name>.xlsx`
+- `dhc_gap_match.py` — the coverage tool. Finds the entities with no DHC ID and
+  proposes one. Imports every normalisation and scoring function from
+  `dhc_match_v2`, so the decisions below are single-sourced; what it deliberately
+  does **not** inherit is decision #4 (see decision #11).
+- `build_coverage_workbook.py` — turns a gap run into the branded deliverable,
+  the sibling of `build_audit_workbook.py`. It **imports** that module's palette
+  and `_put` / `_table` / `sheet_data` rather than copying them, so the two
+  workbooks cannot drift apart; edit the styling in one place only.
+  `py build_coverage_workbook.py --candidates <prefix>_gap_candidates.csv
+  --config sources.yaml [--accuracy <audit>_scored.csv] --out <name>.xlsx`
 - `sources.yaml` — column-role and connection config. **This is the only file to
   edit when a new Definitive export arrives.**
-- **Six Zeus queries**, `Zeus <X> to Definitive ID data quality evaluation.sql`
-  for X in Client, Work Location, HealthSystem, GPO, Agency, VMS. Read live;
-  there is no longer a Zeus workbook. Each reads its own `*Info` table and so
-  its own column names, mapped to roles per-population under `zeus.sources`.
-  See decision #10 for why they are pooled rather than stacked.
+- **Twelve Zeus queries** — two per population, for X in Client, Work Location,
+  HealthSystem, GPO, Agency, VMS:
+  - `Zeus <X> to Definitive ID data quality evaluation.sql` — entities that
+    carry a DHC ID (`query_file` in the config, read by `dhc_match_v2.py`).
+  - `Zeus <X> missing Definitive ID.sql` — entities that carry none
+    (`gap_query_file`, read by `dhc_gap_match.py`).
+
+  They select the same rows through the same joins with the same
+  `EntityDescription` exclusion, and the ID predicate is inverted, so the two
+  populations partition one universe. The complement is **not** a bare `NOT`:
+  see decision #12. Each reads its own `*Info` table and so its own column names,
+  mapped to roles per-population under `zeus.sources` — one mapping serves both
+  queries, because the column aliases are identical. See decision #10 for why
+  populations are pooled rather than stacked.
 - **Identity exports** — one row per Definitive entity, all keyed `DefinitiveId`:
   `Definitive_HospitalOverview.xlsx` (9,870),
   `Definitive_PhysicianGroupOverview.xlsx` (138,385),
@@ -115,6 +153,73 @@ Every run writes `<out>_zeus_extract.csv`, a snapshot of the exact input it
 scored. Zeus is a live moving target and these snapshots are **not** in git (see
 "Version control"), so one is still the only way to reproduce a figure later —
 keep it with any results you circulate. The `--zeus` flag replays one offline.
+
+## Producing a coverage run (the missing IDs)
+
+One command, same config, same `TAG` convention:
+
+```
+py dhc_gap_match.py --config sources.yaml --out gap_<TAG> \
+    --claimed audit_<TAG>_scored.csv
+```
+
+`--claimed` is **optional**: point it at a scored accuracy run and every proposal
+whose ID some other Zeus entity already points at is flagged
+(`Suggested_Id_Already_In_Zeus`). That is not an error — a client entity and a
+work-location entity legitimately share a Definitive record — but it is worth
+seeing before loading. `--zeus <extract.csv>` replays a snapshot offline, and
+`--limit N` scores the first N entities for a quick check.
+
+Writes `gap_<TAG>_gap_candidates.csv` (every entity with a credible proposal,
+best plus two alternates), `gap_<TAG>_gap_nomatch.csv`, and
+`gap_<TAG>_zeus_extract.csv`. **Keep the extract with anything you circulate**,
+for the same reason as the accuracy run. Roughly 20–30 minutes, most of it the
+400k-row location export and the exact-scoring pass.
+
+The output columns that carry the reasoning, and which reviewers need:
+
+| Column | What it answers |
+|---|---|
+| `Match_Tier` | The verdict. See decision #11 for what each tier requires |
+| `Matched_Zeus_Name` / `Matched_Definitive_Name` | **Which two strings actually matched.** Not the same as `Zeus_Name` / `Suggested_Name`: pooling means the winning Zeus name may not be the first one, and the winning Definitive string may be an alias or a service location |
+| `Matched_Via` | `Name`, `Alias` or `Location`. `Location` means Definitive lists your entity as a service location of the proposed parent — the ID is the **parent's**, which is usually what you want but should be understood before loading |
+| `Match_Margin` | Distance to the runner-up. Below 3 the tier is forced to `Ambiguous` |
+| `Same_Name_Rivals` | How many other candidates matched the name about as well |
+| `Suggested_Status_Note` | Definitive's own `(Closed)` / `(Merged)` marker on the proposed record |
+| `Alt1_*`, `Alt2_*` | What was rejected, so a reviewer can overrule the pick |
+
+Then build the deliverable:
+
+```
+py build_coverage_workbook.py --candidates gap_<TAG>_gap_candidates.csv \
+    --config sources.yaml --accuracy audit_<TAG>_scored.csv \
+    --out Zeus_DHC_ID_Coverage_Audit_<TAG>.xlsx
+```
+
+`--accuracy` is **optional**: it adds a whole-estate coverage section to the
+Summary, putting the linked and unlinked populations side by side and stating
+what loading the strong tier would do to coverage. It reads the scored file
+*and* its `_unverifiable.csv` sibling, because both halves are linked entities —
+counting only the scored file understates the estate by 1,704.
+
+Twelve sheets, the accuracy workbook's shape applied to the complement question.
+`Ready_To_Load` is the actionable one; `Parent_Id_Proposals`,
+`Shared_Id_Proposals`, `Id_Already_Linked_In_Zeus` and `Status_Flagged` are the
+four populations to understand before loading; `No_Credible_Match` is the input
+to any "buy more Definitive data" conversation. The builder re-asserts three
+identities and prints OK/FAIL for each: tier counts sum to the population, the
+review sheets plus no-match sum to the population, and the extract's entity
+count equals the population.
+
+Check in the output before circulating anything:
+
+1. `connected to a READ_ONLY database`, as for the accuracy run.
+2. No large `NOTE: ±N vs the expected 48,739 entities`. If the population moved,
+   find out why before quoting a rate, then update `GAP_BASELINE_ENTITIES`.
+3. The tier counts sum to the supplied population, and
+   `gap_candidates` + `gap_nomatch` rows sum to it too.
+4. The strong tier's `Matched_Via` breakdown is mostly `Name`. A sudden jump in
+   `Location` means the filters in decision #13 have stopped biting.
 
 ## Version control
 
@@ -233,6 +338,72 @@ different populations, not the same population before and after a tweak. The
 workbook was deleted on 2026-07-31 and the file-era numbers cannot be
 regenerated.
 
+## Coverage results
+
+First coverage run, 2026-08-19 (`gap_2026_08_19_*`), against the same four
+Definitive sources. 54,242 population rows pooled to **48,739 distinct entities
+carrying no Definitive identifier** — measured with `--claimed` against the
+2026-08-12 accuracy run. 23.7 minutes end to end.
+
+| Of 48,739 Zeus objects with no Definitive identifier | | |
+|---|---|---|
+| Strong match — proposal ready to load | 9,702 | 19.9% |
+| Probable match — review | 6,525 | 13.4% |
+| Ambiguous — rival candidates fit equally | 8,406 | 17.2% |
+| Weak match — review | 7,481 | 15.3% |
+| No credible match in Definitive | 16,561 | 34.0% |
+| No usable Zeus name | 64 | 0.1% |
+
+Those six rows sum to 48,739; `gap_candidates` (32,178) + `gap_nomatch` (16,561)
+does too. **Acting on the strong tier alone would lift identifier coverage from
+20.8% to 36.6%** of all 61,542 Zeus entities. The 22,412 review rows are a
+further 36% of the population, but they need a human.
+
+| Zeus population | No identifier | Strong match |
+|---|---|---|
+| WorkLocation | 29,514 | 5,410 (18.3%) |
+| Client | 24,106 | 5,646 (23.4%) |
+| HealthSystem | 530 | 118 (22.3%) |
+| GPO | 13 | 5 |
+| VMS | 27 | 1 |
+| Agency | 52 | 0 |
+
+Populations overlap (5,461 entities carry more than one flag), so these sum to
+more than 48,739 — the same caveat as decision #10.
+
+**The strong tier is strong.** Median name score 100, median address score 100;
+7,767 of 9,702 (80%) have street-level address agreement rather than merely
+city/state; 8,024 match the name outright; 3,970 are exact name *and* geography.
+By proposed Definitive type: 6,538 PhysicianGroup, 1,593 PracticeLocation,
+1,561 Hospital, 10 GPO. By what matched: 7,867 on the entity's own name, 641 on
+a parenthetical alias, 1,194 on a service location.
+
+Three things to understand before loading any of it:
+
+- **1,593 strong proposals name an id that an id-carrying Zeus entity already
+  points at.** Normal — see the shared-ids note under Known data quirks — but it
+  is a business question, not a data question.
+- **2,738 strong rows propose an id that another *unlinked* entity also
+  proposes**, across 1,049 ids. Investigated, and it is the expected shape
+  rather than over-matching: 32 Zeus work locations propose id 1033471
+  ("New Season") — they are 32 different clinics in 29 cities, each matching a
+  **distinct service location** of that one parent, median address score 100.
+  Definitive holds one id for the chain and Zeus holds 32 branches. Whether that
+  is the wanted grain is a decision for the business.
+- **186 strong proposals name a record Definitive itself marks `(Closed)` or
+  `(Merged)`** (1,007 across all tiers). Reported in `Suggested_Status_Note`,
+  never auto-demoted: a closed record can be the right id for a historical row.
+
+**`Ambiguous` is doing real work at 17.2%.** These are rows where the name is
+probably right but several Definitive records fit within 3 points of each other,
+so taking the argmax would silently pick one. `Tampa General Hospital Clinics`
+lands here against five same-name rivals. Left as an argmax these would have
+been indistinguishable from genuine matches.
+
+**34% have no credible match at all**, which is the single most useful number
+for the "should we buy more Definitive data" question — it is a far better
+target than the 1,704 unverifiable rows on the accuracy side.
+
 ## Decisions that must not be silently reversed
 
 These were derived empirically against this data. Each one exists because the
@@ -321,6 +492,63 @@ naive alternative was measurably wrong.
     takes a maximum, so `DO NOT USE - Banner Health` sitting alongside
     `Banner Health` cannot lower a score.
 
+11. **Coverage must not inherit decision #4's "name outranks address".**
+    Verifying a supplied ID and proposing a new one are different burdens of
+    proof. When Zeus already holds an ID, a name match corroborates it and a
+    divergent address is usually just an out-of-date service location — so the
+    verdict leans on the name and the address is reported separately. When
+    nothing is on record, a name match alone establishes only that *some*
+    Definitive record shares the name, and there are 138,385 physician groups to
+    share it with. `Match_Tier` therefore requires **two independent agreements**
+    before it calls a proposal loadable: either street-level address agreement
+    (`Address_Score >= 85`), or a discriminative match on the entity's own name
+    plus same-place agreement. It also demotes any winner a rival record matches
+    about as well — `Ambiguous - rival candidates`, and on the live population
+    that is the second-largest tier. Do not "simplify" this back to the audit's
+    `verdict()`; the two answer different questions.
+
+12. **The missing-ID complement is not a bare `NOT`.** Three things differ from
+    naively negating the audit query's ID predicate, and each was a real bug:
+    - `NOT EXISTS` against `LinkEntityVerifiedSource`, not a `LEFT JOIN`. An
+      entity can hold several rows there, so "has no Definitive ID" is a claim
+      about all of them; negating one joined row asks a different question.
+    - `ISNULL(e.VerifiedSourceNameId, 0) = 1`. Negating `= 1` on a NULL yields
+      NULL, not TRUE, so a bare `NOT` silently drops every entity whose source
+      name is unset — which is most of this population.
+    - The two ID columns are emitted as **typed NULLs**, not selected raw.
+      `VerifiedSourceNameId` has five values (1 Definitive, 2 Definitive
+      Executive, 4 NPI, 5 Axuall, 6 MDStaff); selecting `e.VerifiedSourceId`
+      directly on a no-Definitive-ID row would carry a **non-Definitive**
+      identifier into a column the tooling reads as a DHC ID. Other-source
+      linkage is exposed separately as `OtherVerifiedSources`, which is there
+      for running the query by hand — `_canonicalise` keeps only the configured
+      role columns, so it does not reach the scored output.
+
+13. **A service-location name may enrich a candidate but must not, on its own,
+    select one.** Decision #9 made every location name an alias of its parent.
+    That is safe when the ID is given — an alias can only raise the score of the
+    one record being tested. It is not safe when the ID is being chosen, because
+    an alias can now *select* a record. Two classes of location name identify
+    nothing and are dropped from the coverage tool's search space and name
+    enrichment (never from its **addresses**, which remain evidence of where the
+    parent operates):
+    - **Shared names** — a name core used by ≥5 distinct parent IDs. `family`
+      sits under 154 parents, `family medicine` 77, `gastroenterology` 53.
+      Drops 1,691 cores / 29,477 rows (7.5%).
+    - **Branch labels** — a name that is only the branch's own city or a compass
+      word: `East Indianapolis` in Indianapolis, `West` in Avon.
+
+    Both were found by tracing false positives, not predicted. `Gastroenterology
+    Associates, P.A.` (Little Rock) was proposed **UAMS Health Physicians**,
+    scoring 96.2 off one of its 135 location names; `Indianapolis Breast Center`
+    was proposed an unrelated ENT practice, scoring 94.4 against a satellite
+    literally named `East Indianapolis` (document frequency 1, so frequency
+    filtering alone would not have caught it). Beyond the filters, a match whose
+    winning string *is* a location name reaches the strong tier only with
+    street-level address agreement — which is what distinguishes a genuine
+    satellite (`Dartmouth Hitchcock - Bedford` → Dartmouth-Hitchcock, address
+    100) from a coincidence.
+
 ## Reporting template
 
 `Zeus_DHC_ID_Accuracy_Audit.xlsx` is retained for its **shape**, which is the
@@ -349,8 +577,13 @@ three changes to the hand-built original:
 - The original stored the `ID_Conflicts` flag as the literal formula `=TRUE()`;
   the generator writes real values.
 
-Latest deliverable: **`Zeus_DHC_ID_Accuracy_Audit_2026_08_12.xlsx`**, from the
-2026-08-12 six-population run. Name deliverables with the **run date**
+Latest deliverables: **`Zeus_DHC_ID_Accuracy_Audit_2026_08_12.xlsx`** from the
+2026-08-12 six-population run, and
+**`Zeus_DHC_ID_Coverage_Audit_2026_08_19.xlsx`** from the 2026-08-19 gap run.
+The coverage workbook follows the same template applied to the complement
+question — see "Producing a coverage run" for its twelve sheets. Both are
+ignored by git (`Zeus_DHC_ID_*.xlsx`); they carry Zeus client names and
+addresses. Name deliverables with the **run date**
 (`_YYYY_MM_DD`), not the month — Zeus is live, so two runs in one month are
 different populations and a month-only name silently overwrites one with the
 other.
@@ -525,6 +758,30 @@ with no connection-string passthrough. An MCP server that takes a full
 connection string, or a small helper on `load_zeus()`, would be needed instead.
 Separately, that entry stores the password in plaintext; `.mcp.json` supports
 `${VAR}` expansion and would fix it.
+
+**7. Coverage follow-ups, opened 2026-08-19.** The tool exists and has run; what
+it raises:
+
+- **Hand-label a coverage sample, before anything is loaded.** Same argument as
+  open work #3, but this queue has no prior labelling at all and proposes
+  *changes* rather than confirming existing data, so the cost of being wrong is
+  higher. Sample the strong tier — 9,702 rows is too many to eyeball, but ~100
+  labelled rows would put a measured precision on it. Start with the 1,194 that
+  matched via a service location and the 186 carrying a status marker.
+- **Decide the grain for chains.** 2,738 strong proposals share an id with
+  another unlinked entity. Definitive models a chain as one parent id plus
+  service locations; Zeus models it as many work locations. Pointing 32 branches
+  at one id is defensible and is what the data supports, but it should be a
+  decision rather than a side effect.
+- **NPI is the untouched lever.** `NPI_NUMBER` is in the physician group export,
+  and `VerifiedSourceNameId = 4` is NPI on the Zeus side. Where both are
+  populated that is a deterministic join, not a fuzzy one — it would both
+  resolve `Ambiguous` rows and validate the strong tier independently. Zeus-side
+  population is thin (71 entities in the missing-id population carry any
+  non-Definitive source), so measure before building.
+- **~~A deliverable workbook.~~ Done 2026-08-19** �
+  `build_coverage_workbook.py`, twelve sheets, latest output
+  `Zeus_DHC_ID_Coverage_Audit_2026_08_19.xlsx`.
 
 ## Residual weakness
 

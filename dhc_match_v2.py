@@ -479,6 +479,10 @@ def load_zeus(zc, out_prefix=None):
             raise SystemExit('zeus config needs `sources` (or `path`).')
         print(f'Zeus source : {c.get("database")} on {c.get("host")}')
         print(f'  intent    : {c.get("application_intent", "ReadWrite")}')
+        # Which key names the query file. The missing-id audit reuses these
+        # same role mappings against a different query per population, so it
+        # sets query_key rather than duplicating the `sources` block.
+        qk = zc.get('query_key', 'query_file')
         frames = []
         with pyodbc.connect(_conn_str(c)) as cx:
             upd = cx.execute(
@@ -489,11 +493,15 @@ def load_zeus(zc, out_prefix=None):
                 print('  WARNING: ReadOnly intent was requested but this '
                       'connection landed on a writable database.')
             for s in srcs:
-                label = s.get('label') or os.path.basename(s['query_file'])
-                raw = pd.read_sql(open(s['query_file']).read(), cx)
+                qf = s.get(qk)
+                if not qf:
+                    raise SystemExit(f'Zeus population "{s.get("label")}" has '
+                                     f'no `{qk}` in the config.')
+                label = s.get('label') or os.path.basename(qf)
+                raw = pd.read_sql(open(qf).read(), cx)
                 frames.append(_canonicalise(raw, s, idc, label))
                 print(f'  {label:14} {len(raw):>7,} rows  '
-                      f'({os.path.basename(s["query_file"])})')
+                      f'({os.path.basename(qf)})')
         u = pd.concat(frames, ignore_index=True)
 
     # LinkEntityVerifiedSource can return several rows per entity within one
@@ -515,12 +523,13 @@ def load_zeus(zc, out_prefix=None):
           f'entities')
     print(f'  {multi:,} entities appear in more than one population '
           f'(names and addresses pooled)')
-    delta = len(z) - ZEUS_BASELINE_ENTITIES
+    base = zc.get('baseline_entities', ZEUS_BASELINE_ENTITIES)
+    delta = (len(z) - base) if base else 0
     if delta:
         print(f'  NOTE: {delta:+,} vs the expected '
-              f'{ZEUS_BASELINE_ENTITIES:,} entities. Expected drift as Zeus '
-              f'changes; investigate anything large, then update '
-              f'ZEUS_BASELINE_ENTITIES.')
+              f'{base:,} entities. Expected drift as Zeus '
+              f'changes; investigate anything large, then update the '
+              f'baseline.')
     return z.reset_index(drop=True)
 
 

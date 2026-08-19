@@ -13,6 +13,13 @@ zeus:
   # ~95.6% of identifier-carrying rows - so counts here are NOT comparable to
   # any run before 2026-07-31.
   #
+  # Each population has TWO queries against the same rows and the same columns:
+  # `query_file` selects the entities that carry a Definitive id (the accuracy
+  # audit, dhc_match_v2.py) and `gap_query_file` selects those that carry none
+  # (the coverage audit, dhc_gap_match.py). They partition one universe, so
+  # their entity counts add to the whole - 12,803 + 48,739 measured 2026-08-19.
+  # The role mappings below serve both; only the query differs.
+  #
   # SIX populations, one query each, each reading its own *Info table and so its
   # own column names. 6,902 of 12,810 entities carry more than one flag, e.g.
   # both IsClient and IsWorkLocation. Those are not duplicates: each Info table
@@ -23,6 +30,7 @@ zeus:
   sources:
     - label: Client
       query_file: Zeus Client to Definitive ID data quality evaluation.sql
+      gap_query_file: Zeus Client missing Definitive ID.sql
       name: [ClientEntityName, ClientInfoName]
       address: [ClientAddress1, ClientAddress2, ClientAddress3]
       city: ClientCity
@@ -31,6 +39,7 @@ zeus:
 
     - label: WorkLocation
       query_file: Zeus Work Location to Definitive ID data quality evaluation.sql
+      gap_query_file: Zeus Work Location missing Definitive ID.sql
       name: [WorkLocationEntityName, WorkLocationInfoName]
       address: [WorkLocationAddress1, WorkLocationAddress2, WorkLocationAddress3]
       city: WorkLocationCity
@@ -39,6 +48,7 @@ zeus:
 
     - label: HealthSystem
       query_file: Zeus HealthSystem to Definitive ID data quality evaluation.sql
+      gap_query_file: Zeus HealthSystem missing Definitive ID.sql
       name: [HealthSystemEntityName, HealthSystemInfoName]
       address: [HealthSystemAddress1, HealthSystemAddress2, HealthSystemAddress3]
       city: HealthSystemCity
@@ -47,6 +57,7 @@ zeus:
 
     - label: GPO
       query_file: Zeus GPO to Definitive ID data quality evaluation.sql
+      gap_query_file: Zeus GPO missing Definitive ID.sql
       name: [GPOEntityName, GPOInfoName]
       address: [GPOAddress1, GPOAddress2, GPOAddress3]
       city: GPOCity
@@ -55,6 +66,7 @@ zeus:
 
     - label: Agency
       query_file: Zeus Agency to Definitive ID data quality evaluation.sql
+      gap_query_file: Zeus Agency missing Definitive ID.sql
       name: [AgencyEntityName, AgencyName]
       address: [AgencyAddress1, AgencyAddress2, AgencyAddress3]
       city: AgencyCity
@@ -63,6 +75,7 @@ zeus:
 
     - label: VMS
       query_file: Zeus VMS to Definitive ID data quality evaluation.sql
+      gap_query_file: Zeus VMS missing Definitive ID.sql
       name: [VMSEntityName, VMSInfoName]
       address: [VMSAddress1, VMSAddress2, VMSAddress3]
       city: VMSCity

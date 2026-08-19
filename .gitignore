@@ -9,12 +9,21 @@ Definitive_*.xlsx
 # Run outputs: Zeus client data (names, addresses), regenerable from the
 # query + sources.yaml. Keep <out>_zeus_extract.csv alongside any circulated
 # result — it is the only way to reproduce a figure later.
-audit_*_scored.csv
-audit_*_unverifiable.csv
-audit_*_zeus_extract.csv
+#
+# Matched on the OUTPUT SUFFIX, not on an `audit_` prefix. The prefix is chosen
+# per run with --out, so a new tool or a differently-named run would otherwise
+# write client data straight past these rules — gap_probe_zeus_extract.csv did
+# exactly that on 2026-08-19.
+*_scored.csv
+*_unverifiable.csv
+*_zeus_extract.csv
+*_gap_candidates.csv
+*_gap_nomatch.csv
 
-# Generated deliverables
-Zeus_DHC_ID_Accuracy_Audit*.xlsx
+# Generated deliverables. Both carry Zeus client names and addresses, so match
+# the family rather than one audit's name — the Coverage workbook was written
+# straight past the Accuracy-only rule on 2026-08-19.
+Zeus_DHC_ID_*.xlsx
 
 # Secrets, in case one ever lands here
 .env
