@@ -28,3 +28,6 @@ Zeus_DHC_ID_*.xlsx
 # Secrets, in case one ever lands here
 .env
 *.local.yaml
+
+# Local tool state
+.sf/

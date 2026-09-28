@@ -53,6 +53,9 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   workbooks cannot drift apart; edit the styling in one place only.
   `py build_coverage_workbook.py --candidates <prefix>_gap_candidates.csv
   --config sources.yaml [--accuracy <audit>_scored.csv] --out <name>.xlsx`
+- `Zeus_DHC_ID_Audit_Business_Overview.md` — plain-language overview of the
+  project for business readers, written 2026-09-28 from the 2026-08-12 and
+  2026-08-19 runs. Its figures are hand-copied, so update it after a new run.
 - `sources.yaml` — column-role and connection config. **This is the only file to
   edit when a new Definitive export arrives.**
 - **Twelve Zeus queries** — two per population, for X in Client, Work Location,
