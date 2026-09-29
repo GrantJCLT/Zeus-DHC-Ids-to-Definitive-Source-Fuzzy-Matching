@@ -12,13 +12,17 @@ so column roles come from a config file. Use --inspect to generate one.
   2. Write (or extend) a config, then run:
        python dhc_match_v2.py run --config sources.yaml --zeus Zeus.xlsx
 
+  Each run writes into its own folder, "Results Output/dhc_match_v2_<YYYY_MM_DD_HHMM>/".
+
 Requires: pandas, numpy, openpyxl, rapidfuzz  (pyyaml optional - JSON works too)
 """
 import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -141,6 +145,110 @@ def norm_zip5(s):
     return dg.zfill(5)[:5] if len(dg) < 5 else dg[:5]
 
 
+def norm_phones(v):
+    """Every usable 10-digit North American number in a cell, as a set.
+
+    A cell may hold several numbers joined with '|' (the location query
+    collects each location's phones that way). A leading country code 1 is
+    dropped and an extension ignored; anything whose area code or exchange
+    starts with 0 or 1 is not a real NANP number and is discarded.
+    """
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return set()
+    out = set()
+    for part in re.split(r'[|;,/]', str(v)):
+        d = re.sub(r'\D', '', part)
+        if len(d) >= 11 and d[0] == '1':
+            d = d[1:]
+        if len(d) >= 10 and d[0] not in '01' and d[3] not in '01':
+            out.add(d[:10])
+    return out
+
+
+# A number held by this many distinct Definitive ids identifies none of them -
+# a central scheduling line or a system switchboard. The same reasoning as the
+# shared-location-name filter in decision #13.
+PHONE_SHARED_MIN = 5
+
+
+def phone_index(d, L):
+    """({id: phones}, {phone: ids}, shared) over every HQ and service location.
+
+    Numbers shared by PHONE_SHARED_MIN or more ids are kept in `by_id` (so a
+    match on one can be recognised as inconclusive rather than read as a
+    disagreement) but removed from `owners`, which drives Phone_Lookup.
+    Built once over the whole reference set, so it is independent of LOC_CAP.
+    """
+    owners = {}
+    pairs = [(d.DHC_Id, d.DHC_Phone)] if 'DHC_Phone' in d else []
+    if L is not None and 'Loc_Phone' in L:
+        pairs.append((L.DHC_Id, L.Loc_Phone))
+    for ids, phones in pairs:
+        for i, v in zip(ids, phones):
+            if pd.isna(i):
+                continue
+            for p in norm_phones(v):
+                owners.setdefault(p, set()).add(int(i))
+    shared = frozenset(p for p, s in owners.items()
+                       if len(s) >= PHONE_SHARED_MIN)
+    by_id = {}
+    for p, s in owners.items():
+        for i in s:
+            by_id.setdefault(i, set()).add(p)
+    owners = {p: s for p, s in owners.items() if p not in shared}
+    return by_id, owners, shared
+
+
+def phone_match(z_phones, dhc_id, by_id, shared=frozenset()):
+    """(True/False/None, the agreeing number).
+
+    True: a number both sides hold that identifies the record. False: both
+    sides hold identifying numbers and none agree. None otherwise - no usable
+    number on one side, or the only overlap is a number shared by
+    PHONE_SHARED_MIN+ records, which agrees but identifies nothing.
+    """
+    zp = set(z_phones or ())
+    dp = by_id.get(int(dhc_id), set()) if pd.notna(dhc_id) else set()
+    hit = zp & dp
+    good = sorted(hit - shared)
+    if good:
+        return True, good[0]
+    if hit or not (zp - shared) or not (dp - shared):
+        return None, None
+    return False, None
+
+
+def phone_lookup(z_phones, owners):
+    """The one Definitive id holding any of these numbers, or None when there
+    is no holder or more than one."""
+    ids = set()
+    for p in z_phones or ():
+        ids |= owners.get(p, set())
+    return next(iter(ids)) if len(ids) == 1 else None
+
+
+def add_phone_columns(df, id_col, d, by_id, owners, shared, prefix='Phone'):
+    """Phone_Match / Matched_Phone for the id in `id_col`, plus Phone_Lookup_*
+    (the single Definitive record holding the entity's number) and
+    Phone_Points_Elsewhere (no match here, but the number is someone else's).
+
+    `df` must carry Z_Phones (a list per row, from _pool).
+    """
+    res = [phone_match(zp, i, by_id, shared)
+           for zp, i in zip(df.Z_Phones, df[id_col])]
+    df[f'{prefix}_Match'] = pd.array([r[0] for r in res], dtype='boolean')
+    df[f'Matched_{prefix}'] = [r[1] for r in res]
+    look = [phone_lookup(zp, owners) for zp in df.Z_Phones]
+    df['Phone_Lookup_DHC_Id'] = pd.array(look, dtype='Int64')
+    names = d.drop_duplicates('DHC_Id').set_index('DHC_Id').DHC_Name
+    df['Phone_Lookup_Name'] = df.Phone_Lookup_DHC_Id.map(names)
+    ids = pd.to_numeric(df[id_col], errors='coerce').astype('Int64')
+    df['Phone_Points_Elsewhere'] = (df[f'{prefix}_Match'].eq(False).fillna(False)
+                                    & df.Phone_Lookup_DHC_Id.notna()
+                                    & df.Phone_Lookup_DHC_Id.ne(ids).fillna(True))
+    return df
+
+
 # ============================================================================
 # Scoring
 # ============================================================================
@@ -176,19 +284,57 @@ def name_score(z_names, d_primary, d_aliases):
     return float(best)
 
 
+def name_provenance(z_names, primary, aliases, loc_names):
+    """Which strings produced the winning name score, and how.
+
+    Mirrors name_score() - the same pairs, the same first-strictly-greater
+    tie-break - so its score equals name_score() over primary + aliases +
+    loc_names. name_score() hides its own reasoning; reviewers need it. A match
+    on the entity's own name is identity evidence, while a match on a service
+    location's name is evidence about a satellite.
+
+    Returns (score, zeus_text, definitive_text, via, core_tokens) where `via` is
+    Name | Alias | Location and `core_tokens` counts the tokens in the winning
+    Definitive core - 1 means a generic single word, the case CLAUDE.md's
+    "How name_core behaves on practices" section warns about.
+    """
+    cands = [(primary, 'Name')] + [(a, 'Alias') for a in (aliases or [])] + \
+            [(n, 'Location') for n in (loc_names or [])]
+    best = (0.0, '', '', '', 0)
+    for zn in z_names:
+        if not zn:
+            continue
+        zf, zc = _clean(zn), name_core(zn)
+        for dn, via in cands:
+            if not dn:
+                continue
+            df_, dc = _clean(dn), name_core(dn)
+            s = pair_score(zf, df_)
+            core_used = False
+            if zc and dc:
+                sc = pair_score(zc, dc)
+                if sc > s:
+                    s, core_used = sc, True
+            if s > best[0]:
+                best = (float(s), zn, dn, via,
+                        len((dc if core_used else df_).split()))
+    return best
+
+
 def addr_scores(z_lines, d_lines):
     """Best pair across all address-line combinations; Zeus's street line is
     not always in the first column.
 
-    Returns (street_number_score, street_body_score, winning_d_index). The
-    index identifies which Definitive line won, so the caller can tell an HQ
-    match from a service-location match.
+    Returns (street_number_score, street_body_score, winning_d_index,
+    winning_z_line). The index identifies which Definitive line won, so the
+    caller can tell an HQ match from a service-location match; the Zeus line
+    says which of the pooled Zeus addresses it was compared with.
     """
     zc = [x for x in z_lines if x and str(x).strip()]
     dc = [(i, x) for i, x in enumerate(d_lines) if x and str(x).strip()]
     if not zc or not dc:
-        return np.nan, np.nan, None
-    best = (-1.0, np.nan, np.nan, None)
+        return np.nan, np.nan, None, None
+    best = (-1.0, np.nan, np.nan, None, None)
     for zl in zc:
         zn, zb = street_number(zl), street_body(zl)
         for di, dl in dc:
@@ -197,8 +343,8 @@ def addr_scores(z_lines, d_lines):
             bs = float(fuzz.ratio(zb, db)) if (zb and db) else np.nan
             tot = (0 if np.isnan(ns) else ns) + (0 if np.isnan(bs) else bs)
             if tot > best[0]:
-                best = (tot, ns, bs, di)
-    return best[1], best[2], best[3]
+                best = (tot, ns, bs, di, zl)
+    return best[1], best[2], best[3], best[4]
 
 
 def weighted(parts, weights):
@@ -337,7 +483,166 @@ def cmd_inspect(paths):
 def read_any(path, **kw):
     if str(path).lower().endswith(('.csv', '.tsv')):
         return pd.read_csv(path, sep=None, engine='python', **kw)
+    if str(path).lower().endswith('.parquet'):
+        df = pd.read_parquet(path)
+        use = kw.get('usecols')
+        return df[[c for c in df.columns if use(c)]] if callable(use) else df
     return pd.read_excel(path, **kw)
+
+
+# ============================================================================
+# Run folders
+# ============================================================================
+RESULTS_DIR = 'Results Output'
+
+
+def new_run_prefix(program, label=None, root=RESULTS_DIR):
+    """Create this run's own folder and return the file prefix inside it.
+
+    Every run writes to <root>/<program>_<YYYY_MM_DD_HHMM>[_<label>]/, and each
+    file in it is named <folder>_<suffix>, so a file copied out of the folder
+    still says which program and which run wrote it. The workbook builders
+    derive a run's sibling files from that prefix and write beside them.
+    """
+    run = f'{program}_{time.strftime("%Y_%m_%d_%H%M")}'
+    if label:
+        run += f'_{label}'
+    folder, n = os.path.join(root, run), 2
+    while os.path.exists(folder):     # two runs in the same minute
+        folder, n = os.path.join(root, f'{run}_{n}'), n + 1
+    os.makedirs(folder)
+    print(f'Run folder  : {folder}')
+    return os.path.join(folder, os.path.basename(folder))
+
+
+def resolve_prefix(p):
+    """A run prefix, or a run folder standing for the prefix of the files in it.
+
+    Folders from before 2026-09-29 hold files named for the old --out prefix
+    (audit_2026_08_12_*), not for the folder, so the prefix is read off the one
+    extract inside rather than assumed from the folder name.
+    """
+    if not os.path.isdir(p):
+        return p
+    hits = [f for f in os.listdir(p) if f.endswith('_zeus_extract.csv')]
+    if len(hits) != 1:
+        raise SystemExit(f'{p} holds {len(hits)} *_zeus_extract.csv files; '
+                         f'pass the run prefix instead of the folder.')
+    return os.path.join(p, hits[0][:-len('_zeus_extract.csv')])
+
+
+# ============================================================================
+# Definitive sources held in Databricks
+# ============================================================================
+ROLE_KEYS = ('id', 'name', 'address', 'city', 'state', 'zip', 'phone')
+
+
+def _role_columns(b):
+    cols = []
+    for k in ROLE_KEYS:
+        v = b.get(k)
+        cols += list(v) if isinstance(v, list) else ([v] if v else [])
+    return list(dict.fromkeys(cols))
+
+
+def _dbx_connect(c):
+    """SQL-warehouse connection authenticated through a Databricks CLI profile.
+
+    The profile holds the OAuth login (`databricks auth login --profile ...`),
+    so no secret lives in the config or the environment.
+    """
+    from databricks import sql
+    from databricks.sdk.core import Config
+    if not c.get('warehouse_id'):
+        raise SystemExit('databricks.warehouse_id is required in the config.')
+    dc = Config(profile=c.get('profile'), host=c.get('host'))
+    return sql.connect(server_hostname=dc.host.replace('https://', ''),
+                       http_path=f'/sql/1.0/warehouses/{c["warehouse_id"]}',
+                       credentials_provider=lambda: dc.authenticate)
+
+
+def _dbx_source(b):
+    """(label, snapshot name, SQL) for a Databricks block.
+
+    `query_file` runs a .sql file as written; `table` is shorthand for a SELECT
+    of the role columns. The snapshot name is `snapshot:` when given, so
+    renaming the .sql file never changes what a run's snapshot is called.
+    """
+    if b.get('query_file'):
+        qf = b['query_file']
+        if not b.get('snapshot'):
+            raise SystemExit(f'Definitive block with query_file "{qf}" needs a '
+                             f'`snapshot:` name in the config.')
+        return os.path.basename(qf), b['snapshot'], open(qf, newline='').read()
+    cols = ', '.join(f'`{x}`' for x in _role_columns(b))
+    return (b['table'], b.get('snapshot') or b['table'].split('.')[-1],
+            f'SELECT {cols} FROM {b["table"]}')
+
+
+def dbx_snapshot_path(prefix, name):
+    return f'{prefix}_dhc_{name}.parquet'
+
+
+def materialise_tables(cfg, prefix, replay=False, copy_to=None):
+    """Swap every Databricks source for a parquet snapshot beside the run outputs.
+
+    Databricks is live, so an xlsx no longer pins the reference data. Each
+    source is queried once per run, written to <prefix>_dhc_<snapshot>.parquet
+    with the SQL that produced it beside it as .sql, and the block repointed at
+    the parquet; everything downstream reads a file as before. With `replay`
+    the snapshot is reused instead of querying - the workbook builders do this
+    so a workbook describes the data its run actually scored. A run replaying
+    another run's snapshots passes `copy_to` (its own prefix): the snapshots
+    are copied into its folder, so every run folder holds its own inputs.
+    """
+    blocks = [b for b in (cfg.get('definitive') or []) +
+              (cfg.get('locations') or [])
+              if b.get('query_file') or b.get('table')]
+    if not blocks:
+        return
+    if replay:
+        for b in blocks:
+            label, name, _ = _dbx_source(b)
+            snap = dbx_snapshot_path(prefix, name)
+            if not os.path.exists(snap):
+                # Reading live here would describe different data from the run.
+                raise SystemExit(
+                    f'No Definitive snapshot {snap} for {label}.\n'
+                    f'  The run that wrote {prefix}_* either predates Databricks '
+                    f'sourcing or its snapshot was moved; keep the snapshot '
+                    f'with the run outputs.')
+            if copy_to:
+                dst = dbx_snapshot_path(copy_to, name)
+                for ext in ('.parquet', '.sql'):
+                    src = snap[:-len('.parquet')] + ext
+                    if os.path.exists(src):
+                        shutil.copyfile(src, dst[:-len('.parquet')] + ext)
+                print(f'  {label}: snapshot {snap} -> {dst}')
+                snap = dst
+            else:
+                print(f'  {label}: snapshot {snap}')
+            b['path'] = snap
+        return
+    c = cfg.get('databricks') or {}
+    print(f'Databricks  : {c.get("host")} (warehouse {c.get("warehouse_id")})')
+    with _dbx_connect(c) as cx, cx.cursor() as cur:
+        for b in blocks:
+            label, name, q = _dbx_source(b)
+            cur.execute(q)
+            df = cur.fetchall_arrow().to_pandas()
+            missing = [x for x in _role_columns(b) if x not in df.columns]
+            if missing:
+                raise SystemExit(
+                    f'Definitive source "{label}" is missing column(s): '
+                    f'{missing}\n  returned: {list(df.columns)}\n'
+                    f'  fix sources.yaml or the query so they match.')
+            snap = dbx_snapshot_path(prefix, name)
+            df.to_parquet(snap, index=False)
+            # newline='' so the copy is byte-identical to the .sql it came from.
+            with open(snap[:-len('.parquet')] + '.sql', 'w', newline='') as f:
+                f.write(q)
+            print(f'  {label}: {len(df):,} rows -> {snap}')
+            b['path'] = snap
 
 
 def load_config(path):
@@ -443,10 +748,34 @@ def _pool(u, idc):
             v = pd.to_numeric(g[c], errors='coerce').dropna()
             ids[c] = int(v.iloc[0]) if len(v) else None
         srcs = sorted(dict.fromkeys(g.Zeus_Source))
+        # Which population(s) hold each name, so a verdict can say whether it
+        # rests on, say, the Client name or the Work Location name.
+        # Likewise where each address line sits (its row's city/state/zip), so
+        # the matched Zeus line is shown with its own place, not every pooled
+        # city. First row with the line wins.
+        name_src, addr_geo = {}, {}
+        for r in g.itertuples(index=False):
+            for c in Z_NAMES:
+                v = getattr(r, c)
+                if isinstance(v, str) and v.strip():
+                    name_src.setdefault(v, set()).add(r.Zeus_Source)
+            for c in Z_ADDRS:
+                v = getattr(r, c)
+                if isinstance(v, str) and v.strip() and v not in addr_geo:
+                    addr_geo[v] = (r.Z_City, r.Z_State,
+                                   r.Z_Zip if pd.notna(r.Z_Zip) else None)
         rows.append({
             'EntityId': eid,
             'Zeus_Sources': '|'.join(srcs),
             'Zeus_Source_Count': len(srcs),
+            'Z_Name_Sources': {k: '|'.join(sorted(v))
+                               for k, v in name_src.items()},
+            'Z_Addr_Geo': addr_geo,
+            # Every population's numbers, pooled like names and addresses.
+            # norm_phones, not a split: a replayed CSV may read one number as
+            # a float ('5551234567.0').
+            'Z_Phones': sorted({p for v in g.Z_Phones.dropna()
+                                for p in norm_phones(v)}),
             'Z_Names': uniq([v for c in Z_NAMES for v in g[c]]),
             'Z_Addrs': uniq([v for c in Z_ADDRS for v in g[c]]),
             'Z_Cities': uniq(g.Z_City),
@@ -455,6 +784,24 @@ def _pool(u, idc):
             **ids,
         })
     return pd.DataFrame(rows)
+
+
+def _attach_phones(u, phones):
+    """Add Z_Phones - that population row's usable numbers, '|'-joined.
+
+    `phones` is the phone query's result: EntityId, Zeus_Source (a population
+    label) and Phone. Keyed on the population as well as the entity, because
+    each *Info table holds its own numbers, just as it holds its own name and
+    address. Stored in the extract so a replay has the same phones.
+    """
+    if phones is None or not len(phones):
+        u['Z_Phones'] = None
+        return u
+    ph = phones.assign(_p=phones.Phone.map(norm_phones))
+    ph = ph[ph._p.map(len) > 0]
+    agg = (ph.groupby(['EntityId', 'Zeus_Source'])._p
+           .agg(lambda s: '|'.join(sorted(set().union(*s)))).rename('Z_Phones'))
+    return u.merge(agg.reset_index(), on=['EntityId', 'Zeus_Source'], how='left')
 
 
 def load_zeus(zc, out_prefix=None):
@@ -471,6 +818,10 @@ def load_zeus(zc, out_prefix=None):
         if missing:
             raise SystemExit(f'Archived extract is missing {missing}; it must '
                              f'be a <prefix>_zeus_extract.csv from a live run.')
+        if 'Z_Phones' not in u.columns:
+            print('  note: this extract predates phone capture (2026-09-29); '
+                  'Phone_Match will be blank throughout.')
+            u['Z_Phones'] = None
     else:
         import pyodbc
         c = zc.get('connection') or {}
@@ -502,7 +853,14 @@ def load_zeus(zc, out_prefix=None):
                 frames.append(_canonicalise(raw, s, idc, label))
                 print(f'  {label:14} {len(raw):>7,} rows  '
                       f'({os.path.basename(qf)})')
+            phones = None
+            if zc.get('phone_query_file'):
+                pq = zc['phone_query_file']
+                phones = pd.read_sql(open(pq).read(), cx)
+                print(f'  {"phones":14} {len(phones):>7,} rows  '
+                      f'({os.path.basename(pq)})')
         u = pd.concat(frames, ignore_index=True)
+        u = _attach_phones(u, phones)
 
     # LinkEntityVerifiedSource can return several rows per entity within one
     # population; collapse those before pooling across populations.
@@ -542,7 +900,7 @@ def _read_roles(b, cols):
 
 
 def _identity_frame(b):
-    df = _read_roles(b, ('id', 'name', 'address', 'city', 'state', 'zip'))
+    df = _read_roles(b, ROLE_KEYS)
     ac = [c for c in (b.get('address') or []) if c in df.columns]
     return pd.DataFrame({
         'DHC_Id': pd.to_numeric(df[b['id']], errors='coerce').astype('Int64'),
@@ -553,6 +911,7 @@ def _identity_frame(b):
         'DHC_City': df[b['city']] if b.get('city') else None,
         'DHC_State': df[b['state']] if b.get('state') else None,
         'DHC_Zip': df[b['zip']] if b.get('zip') else None,
+        'DHC_Phone': df[b['phone']] if b.get('phone') else None,
     })
 
 
@@ -605,7 +964,7 @@ def load_locations(blocks):
         return None
     frames = []
     for b in blocks:
-        df = _read_roles(b, ('id', 'name', 'address', 'city', 'state', 'zip'))
+        df = _read_roles(b, ROLE_KEYS)
         ac = [c for c in (b.get('address') or []) if c in df.columns]
         out = pd.DataFrame({
             'DHC_Id': pd.to_numeric(df[b['id']], errors='coerce').astype('Int64'),
@@ -615,6 +974,7 @@ def load_locations(blocks):
             'Loc_City': df[b['city']] if b.get('city') else None,
             'Loc_State': df[b['state']] if b.get('state') else None,
             'Loc_Zip': df[b['zip']] if b.get('zip') else None,
+            'Loc_Phone': df[b['phone']] if b.get('phone') else None,
         })
         print(f'  loaded {len(out):>8,}  locations  '
               f'({os.path.basename(b["path"])})')
@@ -639,6 +999,7 @@ def locations_as_identity(L, known_ids):
         'DHC_Addr1': first.Loc_Addr1, 'DHC_Addr2': first.Loc_Addr2,
         'DHC_City': first.Loc_City, 'DHC_State': first.Loc_State,
         'DHC_Zip': first.Loc_Zip,
+        'DHC_Phone': first.Loc_Phone if 'Loc_Phone' in first else None,
     })
 
 
@@ -656,9 +1017,18 @@ def location_index(L, need_ids):
             if isinstance(x, str) and x.strip()]
         if len(names) > LOC_CAP or len(addrs) > LOC_CAP:
             capped += 1
+        # Where each address line is, as Definitive wrote it, so a matched
+        # satellite line can be shown with its own city/state/zip rather than
+        # the HQ's. First location with the line wins.
+        geo = {}
+        for r in g.itertuples(index=False):
+            for a in (r.Loc_Addr1, r.Loc_Addr2):
+                if isinstance(a, str) and a.strip() and a not in geo:
+                    geo[a] = (r.Loc_City, r.Loc_State, r.Loc_Zip)
         idx[int(key)] = {
             'n': len(g),
             'names': names[:LOC_CAP], 'addrs': addrs[:LOC_CAP],
+            'addr_geo': geo,
             'cities': {_clean(x) for x in g.Loc_City
                        if isinstance(x, str)} - {''},
             'states': {norm_state(x) for x in g.Loc_State
@@ -675,14 +1045,22 @@ def enriched_scores(z_names, z_lines, zcities, zstates, zzips, ent, loc):
     population the entity belongs to, and the Definitive side offers its HQ plus
     every known service location. Each component takes the best available
     match, so extra candidates can only ever raise a score.
+
+    The 8th element says which address pair produced the street scores:
+    {'zeus_addr', 'dhc_addr', 'dhc_geo'}, where dhc_geo is the matched service
+    location's (city, state, zip) and None for an HQ line or no match.
     """
     aliases = list(ent['aliases'] or []) + (loc['names'] if loc else [])
     nm = name_score(z_names, ent['primary'], aliases)
 
     hq_lines = [x for x in ent['lines'] if x and str(x).strip()]
     d_lines = hq_lines + (loc['addrs'] if loc else [])
-    an, ab, src = addr_scores(z_lines, d_lines)
+    an, ab, src, zline = addr_scores(z_lines, d_lines)
     source = '' if src is None else ('HQ' if src < len(hq_lines) else 'Location')
+    dline = None if src is None else d_lines[src]
+    prov = {'zeus_addr': zline, 'dhc_addr': dline, 'source': source,
+            'dhc_geo': (loc.get('addr_geo', {}).get(dline)
+                        if source == 'Location' else None)}
 
     cities = ([ent['city']] if ent['city'] else []) + \
              (sorted(loc['cities']) if loc else [])
@@ -697,12 +1075,45 @@ def enriched_scores(z_names, z_lines, zcities, zstates, zzips, ent, loc):
     zips = ({ent['zip']} if ent['zip'] else set()) | \
            (loc['zips'] if loc else set())
     zp = (100.0 if (set(zzips) & zips) else 0.0) if (zzips and zips) else np.nan
-    return nm, an, ab, cs, st, zp, source
+    return nm, an, ab, cs, st, zp, source, prov
 
 
-def cmd_run(cfg, out_prefix, reverse=True):
+# The address pair behind Address_Score, one set per side. Definitive city/state/
+# zip are the matched line's own - a satellite's for a Location match, the HQ's
+# otherwise. City_Score and Zip_Score are still computed across every known site.
+MATCHED_ADDR_COLS = ['Matched_Zeus_Address', 'Matched_Zeus_City',
+                     'Matched_Zeus_State', 'Matched_Zeus_Zip',
+                     'Matched_Definitive_Address', 'Matched_Definitive_City',
+                     'Matched_Definitive_State', 'Matched_Definitive_Zip']
+
+
+def matched_address(prov, z_addr_geo, hq_geo):
+    """The eight MATCHED_ADDR_COLS values for one scored pair.
+
+    `z_addr_geo` is the entity's {address: (city, state, zip)} from _pool;
+    `hq_geo` is the Definitive record's HQ (city, state, zip).
+    """
+    za, da = prov.get('zeus_addr'), prov.get('dhc_addr')
+    zg = (z_addr_geo or {}).get(za, (None,) * 3) if za else (None,) * 3
+    if not da:
+        dg = (None,) * 3
+    elif prov.get('source') == 'HQ':
+        dg = hq_geo
+    else:
+        dg = prov.get('dhc_geo') or (None,) * 3
+    return (za, *zg, da, *dg)
+
+
+def cmd_run(cfg, out_prefix, reverse=True, definitive_from=None):
     zc = cfg['zeus']
     z = load_zeus(zc, out_prefix)
+
+    print('\nDefinitive tables:')
+    if definitive_from:
+        materialise_tables(cfg, definitive_from, replay=True,
+                           copy_to=out_prefix)
+    else:
+        materialise_tables(cfg, out_prefix)
 
     print('\nDefinitive location sources:')
     L = load_locations(cfg.get('locations'))
@@ -744,6 +1155,17 @@ def cmd_run(cfg, out_prefix, reverse=True):
                  on='DHC_Id', how='left', indicator=True)
     zj['ID_Found'] = zj['_merge'] == 'both'
     zj = zj.drop(columns='_merge')
+
+    # Phone: a third signal, independent of name and address. Reported beside
+    # the verdict, never folded into it (decision #4 keeps Verdict about name
+    # and address). Computed before the testable split so an unverifiable id
+    # still gets a Phone_Lookup - the one Definitive record holding its number.
+    by_id, owners, shared = phone_index(d, L)
+    zj = add_phone_columns(zj, 'DHC_Id', d, by_id, owners, shared)
+    print(f'Phones      : {int(zj.Z_Phones.map(len).gt(0).sum()):,} of {len(zj):,} '
+          f'entities carry a usable Zeus phone; {len(owners):,} Definitive '
+          f'numbers usable, {len(shared):,} shared by {PHONE_SHARED_MIN}+ ids '
+          f'ignored')
     sub = zj[zj.ID_Found].copy()
 
     print(f'ID populated : {z.DHC_Id.notna().sum():,}')
@@ -760,19 +1182,35 @@ def cmd_run(cfg, out_prefix, reverse=True):
             print(f'  note: {capped:,} ids exceeded the {LOC_CAP}-location cap; '
                   f'the rest were not scored')
 
-    rows = []
+    rows, prov = [], []
     for r in sub.itertuples(index=False):
         ent = {'primary': r.d_primary, 'aliases': r.d_aliases,
                'lines': (r.DHC_Addr1, r.DHC_Addr2), 'city': r.d_city_n,
                'state': r.d_state, 'zip': r.d_zip5}
+        loc = LOC.get(int(r.DHC_Id)) if pd.notna(r.DHC_Id) else None
         rows.append(enriched_scores(
             r.Z_Names, r.Z_Addrs, r.Z_Cities_N, r.Z_States_N, r.Z_Zips_N,
-            ent, LOC.get(int(r.DHC_Id)) if pd.notna(r.DHC_Id) else None))
+            ent, loc))
+        _, ztxt, dtxt, via, _ = name_provenance(
+            r.Z_Names, r.d_primary, r.d_aliases, loc['names'] if loc else [])
+        prov.append((ztxt, r.Z_Name_Sources.get(ztxt, ''), dtxt, via) +
+                    matched_address(rows[-1][7], r.Z_Addr_Geo,
+                                    (r.DHC_City, r.DHC_State, r.DHC_Zip)))
 
     for i, c in enumerate(['Name_Score', 'StreetNum_Score', 'StreetName_Score',
                            'City_Score', 'State_Score', 'Zip_Score']):
         sub[c] = np.round([x[i] for x in rows], 1)
     sub['Address_Match_Source'] = [x[6] for x in rows]
+    # Which two strings produced Name_Score. Pooling means the winning Zeus
+    # name may come from any population the entity belongs to;
+    # Matched_Zeus_Source names it, so e.g. a Work Location entity that is also
+    # a Client can be seen to rest on its Client name.
+    # The address pair behind Address_Score, likewise: Zeus_Address is only the
+    # first pooled address, and the Definitive line may be a satellite.
+    for i, c in enumerate(['Matched_Zeus_Name', 'Matched_Zeus_Source',
+                           'Matched_Definitive_Name', 'Matched_Via'] +
+                          MATCHED_ADDR_COLS):
+        sub[c] = [x[i] for x in prov]
     sub['Location_Count'] = [
         (LOC.get(int(i), {}).get('n', 0) if pd.notna(i) else 0)
         for i in sub.DHC_Id]
@@ -805,6 +1243,19 @@ def cmd_run(cfg, out_prefix, reverse=True):
     print(f'\n  {"Address divergent (corroborated, addr<60)":42} {ad:>7,}')
     print(f'  {"Geo conflict (name>=92, state disagrees)":42} {gc:>7,}'
           f'  <-- review separately')
+
+    pm = sub.Phone_Match
+    print(f'\n--- Phone (independent of Verdict) ---')
+    print(f'  {"phone on both sides":42} {int(pm.notna().sum()):>7,}')
+    print(f'  {"  numbers agree":42} {int(pm.eq(True).sum()):>7,}  '
+          f'{pm.eq(True).sum() / max(int(pm.notna().sum()), 1):6.1%}')
+    print(f'  {"  number belongs to another record":42} '
+          f'{int(sub.Phone_Points_Elsewhere.sum()):>7,}  <-- review')
+    for v in ['Needs review', 'Likely wrong ID']:
+        s_ = sub[sub.Verdict == v]
+        print(f'  {v:42} phone agrees {int(s_.Phone_Match.eq(True).sum()):>5,} / '
+              f'points elsewhere {int(s_.Phone_Points_Elsewhere.sum()):>5,} '
+              f'of {len(s_):,}')
 
     if 'DHC_Entity_Type' in sub.columns and sub.DHC_Entity_Type.nunique() > 1:
         print('\n--- By Definitive entity type ---')
@@ -882,7 +1333,7 @@ def cmd_run(cfg, out_prefix, reverse=True):
                    'lines': (p.DHC_Addr1, p.DHC_Addr2), 'city': p.d_city_n,
                    'state': p.d_state, 'zip': p.d_zip5}
             cand_loc = suggest_loc.get(int(p.DHC_Id))
-            nm, an, ab, cs, st2, zp, _ = enriched_scores(
+            nm, an, ab, cs, st2, zp, _, _ = enriched_scores(
                 r.Z_Names, r.Z_Addrs, r.Z_Cities_N, r.Z_States_N, r.Z_Zips_N,
                 ent, cand_loc)
             recs.append({
@@ -916,16 +1367,19 @@ def cmd_run(cfg, out_prefix, reverse=True):
         out['Zeus_City'] = [' | '.join(v) for v in out.Z_Cities]
         out['Zeus_State'] = [' | '.join(v) for v in out.Z_States]
         out['Zeus_Zip'] = [' | '.join(str(x) for x in v) for v in out.Z_Zips]
+        out['Zeus_Phones'] = [' | '.join(v) for v in out.Z_Phones]
         return out.drop(columns=[c for c in
                                  ['Z_Names', 'Z_Addrs', 'Z_Cities', 'Z_States',
-                                  'Z_Zips', 'Z_Cities_N', 'Z_States_N',
+                                  'Z_Zips', 'Z_Phones', 'Z_Name_Sources',
+                                  'Z_Addr_Geo',
+                                  'Z_Cities_N', 'Z_States_N',
                                   'Z_Zips_N', 'd_primary', 'd_aliases',
                                   'd_city_n', 'd_state', 'd_zip5', 'core',
                                   'core_alias'] if c in out.columns])
 
     lead = ['EntityId', 'Zeus_Sources', 'Zeus_Source_Count', 'Zeus_Name',
             'Zeus_Names_All', 'Zeus_Address', 'Zeus_Addresses_All',
-            'Zeus_City', 'Zeus_State', 'Zeus_Zip']
+            'Zeus_City', 'Zeus_State', 'Zeus_Zip', 'Zeus_Phones']
     detail = flatten(sub)
     detail = detail[[c for c in lead if c in detail.columns] +
                     [c for c in detail.columns if c not in lead]]
@@ -935,8 +1389,11 @@ def cmd_run(cfg, out_prefix, reverse=True):
     unver = zj[~zj.ID_Found]
     if len(unver):
         u = flatten(unver)
+        # Phone_Lookup_* is the one lead an unverifiable row has: the
+        # Definitive record that holds the entity's phone number, if any.
         cols = ['EntityId', 'Zeus_Sources', 'Zeus_Name', 'Zeus_Names_All',
-                'Zeus_City', 'Zeus_State', 'DHC_Id', 'DHC_Id_Source']
+                'Zeus_City', 'Zeus_State', 'Zeus_Phones', 'DHC_Id',
+                'DHC_Id_Source', 'Phone_Lookup_DHC_Id', 'Phone_Lookup_Name']
         u[[c for c in cols if c in u.columns]].to_csv(
             f'{out_prefix}_unverifiable.csv', index=False)
         print(f'Wrote {out_prefix}_unverifiable.csv  ({len(unver):,} rows)')
@@ -953,9 +1410,16 @@ def main():
     r.add_argument('--config', required=True)
     r.add_argument('--zeus', help='read Zeus from this file instead of the '
                                   'configured query (offline re-run)')
-    r.add_argument('--out', default='dhc_audit')
+    r.add_argument('--label', '--out', dest='label',
+                   help='optional suffix for the run folder name; the folder '
+                        f'is always "{RESULTS_DIR}/dhc_match_v2_<date>_<time>"')
+    r.add_argument('--results-dir', default=RESULTS_DIR)
     r.add_argument('--no-reverse', action='store_true',
                    help='skip the reverse lookup (faster)')
+    r.add_argument('--definitive-from', metavar='PREFIX',
+                   help='reuse the Databricks snapshots of an earlier run '
+                        '(<PREFIX>_dhc_*.parquet, or that run\'s folder) '
+                        'instead of querying live')
     a = ap.parse_args()
 
     if a.cmd == 'inspect':
@@ -966,7 +1430,10 @@ def main():
             # An explicit file overrides the live query, not the reverse.
             cfg['zeus']['path'] = a.zeus
             cfg['zeus'].pop('query_file', None)
-        cmd_run(cfg, a.out, reverse=not a.no_reverse)
+        prefix = new_run_prefix('dhc_match_v2', a.label, a.results_dir)
+        cmd_run(cfg, prefix, reverse=not a.no_reverse,
+                definitive_from=a.definitive_from and
+                resolve_prefix(a.definitive_from))
 
 
 if __name__ == '__main__':

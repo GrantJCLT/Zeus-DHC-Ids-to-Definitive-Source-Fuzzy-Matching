@@ -5,6 +5,13 @@ __pycache__/
 # Licensed Definitive Healthcare exports — do not redistribute.
 # Confirm terms with the licence owner before these leave this machine.
 Definitive_*.xlsx
+# Per-run snapshots of the Databricks-held Definitive tables - same licence.
+*_dhc_*.parquet
+
+# Every run writes into its own folder here - Zeus client data, Definitive
+# snapshots and the workbooks built from them. Ignored wholesale; the suffix
+# rules below still catch any file written outside it.
+Results Output/
 
 # Run outputs: Zeus client data (names, addresses), regenerable from the
 # query + sources.yaml. Keep <out>_zeus_extract.csv alongside any circulated
@@ -31,3 +38,5 @@ Zeus_DHC_ID_*.xlsx
 
 # Local tool state
 .sf/
+
+.databricks

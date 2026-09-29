@@ -1,0 +1,19 @@
+# This is a Declarative Automation Bundle definition for Zeus DHC Ids to Definitive Source Fuzzy Matching.
+# The Databricks extension requires databricks.yml configuration file.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: Zeus DHC Ids to Definitive Source Fuzzy Matching
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-8032826808193104.4.azuredatabricks.net
+
+  ## Optionally, there could be 'staging' or 'prod' targets here.
+  #
+  # prod:
+  #   workspace:
+  #     host: https://adb-8032826808193104.4.azuredatabricks.net

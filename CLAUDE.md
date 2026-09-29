@@ -41,8 +41,8 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   anything in it as superseded, not as a reference.)
 - `build_audit_workbook.py` — turns a scored run into the branded deliverable.
   Everything in it is derived from the run, so it is re-runnable:
-  `py build_audit_workbook.py --scored <prefix>_scored.csv --config sources.yaml
-  [--baseline <earlier>_scored.csv] --out <name>.xlsx`
+  `py build_audit_workbook.py --scored <run>_scored.csv
+  [--baseline <earlier>_scored.csv] [--out <name>.xlsx]`
 - `dhc_gap_match.py` — the coverage tool. Finds the entities with no DHC ID and
   proposes one. Imports every normalisation and scoring function from
   `dhc_match_v2`, so the decisions below are single-sourced; what it deliberately
@@ -51,11 +51,19 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   the sibling of `build_audit_workbook.py`. It **imports** that module's palette
   and `_put` / `_table` / `sheet_data` rather than copying them, so the two
   workbooks cannot drift apart; edit the styling in one place only.
-  `py build_coverage_workbook.py --candidates <prefix>_gap_candidates.csv
-  --config sources.yaml [--accuracy <audit>_scored.csv] --out <name>.xlsx`
+  `py build_coverage_workbook.py --candidates <run>_gap_candidates.csv
+  [--accuracy <audit>_scored.csv] [--out <name>.xlsx]`
 - `Zeus_DHC_ID_Audit_Business_Overview.md` — plain-language overview of the
   project for business readers, written 2026-09-28 from the 2026-08-12 and
   2026-08-19 runs. Its figures are hand-copied, so update it after a new run.
+- `Usage.md` — operator guide, written 2026-09-29: where to run, the commands
+  for both audits, expected console output and the checks to make, files
+  written, and common failures. Update it when a flag, output file or sheet
+  changes.
+- `Environment.md` — handover guide for a new Windows 11 machine, written
+  2026-09-29: access to request, software and package versions, secrets and
+  Databricks login, which Python to use (the `.venv` trap), and development
+  notes. Update it when a dependency or connection setting changes.
 - `sources.yaml` — column-role and connection config. **This is the only file to
   edit when a new Definitive export arrives.**
 - **Twelve Zeus queries** — two per population, for X in Client, Work Location,
@@ -72,13 +80,31 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   mapped to roles per-population under `zeus.sources` — one mapping serves both
   queries, because the column aliases are identical. See decision #10 for why
   populations are pooled rather than stacked.
-- **Identity exports** — one row per Definitive entity, all keyed `DefinitiveId`:
-  `Definitive_HospitalOverview.xlsx` (9,870),
-  `Definitive_PhysicianGroupOverview.xlsx` (138,385),
-  `Definitive_GPO_Overview.xlsx` (212). They share no ids.
-- `Definitive_Practice_Locations.xlsx` — **a child table, not an identity
-  export.** 399,990 service locations across 176,658 parent ids. Configured
-  under `locations:`, never `definitive:`. See decision #9.
+- `Zeus entity phones.sql` — every population's phone numbers in one query
+  (`zeus.phone_query_file`), labelled with the population so they pool like
+  names and addresses. Its `Zeus_Source` labels must equal the `label:` values
+  under `zeus.sources`. See decision #14.
+- **Four Definitive queries**, one per Databricks view in
+  `prd_silver.definitive`, all read live since 2026-09-29 — see "Definitive in
+  Databricks" below. Each replaced an xlsx export that was a pull of the same
+  view with its columns renamed; the xlsx files are no longer read.
+
+  | Query file | View | Rows 2026-09-29 | Replaced |
+  |---|---|---|---|
+  | `Definitive Hospital Overview.sql` | `hospitaloverview` | 9,887 | `Definitive_HospitalOverview.xlsx` (9,870) |
+  | `Definitive Physician Group Overview.sql` | `physiciangroupsoverview` | 141,801 | `Definitive_PhysicianGroupOverview.xlsx` (138,385) |
+  | `Definitive GPO Overview.sql` | `grouppurchasingorganizationoverview` | 213 | `Definitive_GPO_Overview.xlsx` (212) |
+  | `Definitive Practice Locations.sql` | `physicianspracticelocations` | 396,386 | `Definitive_Practice_Locations.xlsx` (399,990) |
+
+  The first three are **identity sources**, one row per entity, keyed
+  `HospitalId` in every view (for physician groups that is the practice's own
+  id, not a parent). They share no ids. The fourth is **a child table, not an
+  identity source**: configured under `locations:`, never `definitive:` (decision
+  #9), keyed `PracticeLocationHospitalId`, the parent's id. Its view is one row
+  per *physician* per location (~4.6M rows); the query's `DISTINCT` and
+  `WHERE PracticeLocationHospitalId IS NOT NULL` reduce it to one row per
+  location of a known parent — drop either and the location set is wrong
+  (~1.09M distinct locations carry no parent id).
 - `Zeus_DHC_ID_Accuracy_Audit.xlsx` — **kept as the reporting format template,
   not as a result.** Its numbers are file-era and must not be quoted; see
   "Reporting template" below for the structure worth reusing.
@@ -100,35 +126,193 @@ Zeus is read live from the failover replica. Two things are required:
 
 ```
 py dhc_match_v2.py inspect <NewDefinitiveExport.xlsx>
-py dhc_match_v2.py run --config sources.yaml --out audit_2026_08 [--no-reverse]
-py dhc_match_v2.py run --config sources.yaml --zeus <archived_extract.csv> ...
+py dhc_match_v2.py run --config sources.yaml [--label <suffix>] [--no-reverse]
+py dhc_match_v2.py run --config sources.yaml --zeus <archived_extract.csv> \
+    --definitive-from "Results Output/<archived run folder>" ...
 ```
+
+### Definitive in Databricks
+
+A block under `definitive:` or `locations:` names one of `path:` (a local
+export), `query_file:` (a Databricks SQL file, run as written) or `table:` (a
+Unity Catalog table or view — shorthand for a `SELECT` of the role columns).
+**Each query lives in a `.sql` file, like the Zeus queries** — the four
+`Definitive *.sql` files, tracked in git, runnable by hand in the Databricks SQL
+editor. Edit it to filter or join; its output column names must
+still match the block's roles, and a run stops and names any that are missing.
+A `query_file` block also needs `snapshot:`, which names the snapshot file, so
+renaming the `.sql` never changes it. Both kinds are read through the
+top-level `databricks:` block — workspace host, CLI profile `jcl`, and the
+`qat-eus-jcl-Databricks-W-M` warehouse — needing `databricks-sql-connector`,
+`databricks-sdk` and `pyarrow`. Authentication is OAuth held by the Databricks
+CLI; if a run fails to authenticate, re-run
+`databricks auth login --profile jcl`. No secret is stored anywhere.
+
+Databricks is live, so `materialise_tables()` queries each source **once per
+run**, writes `<run>_dhc_<snapshot>.parquet` plus a byte-identical copy of the
+SQL it ran as `<run>_dhc_<snapshot>.sql`, and repoints the block at the
+parquet; everything downstream reads a file exactly as before. The `.sql` copy
+records which query produced a snapshot even after the tracked file is edited.
+Consequences:
+
+- The snapshot is to Definitive what `_zeus_extract.csv` is to Zeus. **Keep it
+  with the run outputs.** `--definitive-from <run folder or prefix>` replays it; with both
+  `--zeus` and `--definitive-from` a run is fully offline and reproducible.
+  A replaying run **copies** the snapshots (and their `.sql`) into its own
+  folder, so its workbook can be built from that folder alone — before
+  2026-09-29 it did not, and the builder refused such a run.
+- `build_audit_workbook.py` reads the run's own snapshot (derived from the
+  `--scored` prefix) and **stops** if it is missing rather than reading live —
+  a workbook built from different reference data than the run scored would be
+  internally inconsistent. Runs from before 2026-09-29 have no snapshot; build
+  those with a config that still points at the xlsx.
+- Snapshots are parquet, not csv, so zip codes and ids keep their types.
+- **The views are refreshed in place.** The parquet files behind
+  `physicianspracticelocations` were all rewritten on 2026-09-29 at 15:32 UTC.
+  Two runs an hour apart can read different Definitive data; only the snapshot
+  says which a result used.
+
+Verified 2026-09-29, hospitals only, by replaying the 2026-08-12 Zeus extract
+against the live view: 11,099 testable and 1,704 unverifiable, both unchanged; 5 verdicts moved,
+every one a hospital Definitive has renamed since the xlsx was pulled (3 up,
+2 down); 10,740 → 10,741 corroborated. Definitive's `(Closed)` / `(Merged)`
+name markers survive in the view (1,134 names versus 1,130 in the xlsx), so
+`Suggested_Status_Note` is unaffected. The view also has a `CompanyStatus`
+column (Active / Closed / Opening) that the tools do not read yet — 247 hospitals
+are `Closed` there with no marker in the name.
+
+**All four views, 2026-09-29**, replaying the archived Zeus extracts so that
+only the Definitive side changed (runs `*_2026_09_29_1214_all4_dbx_test`):
+
+- Accuracy, against 2026-08-12: 11,098 testable (−1: Definitive has since
+  dropped that id), 10,735 corroborated (was 10,740), 98.8% corroborated-or-
+  probable (unchanged), 35 recommended corrections (was 33). 15 verdicts moved,
+  5 up and 10 down, every one traced to a Definitive rename or to a location
+  name that no longer exists (e.g. Fort Meade VA lost its
+  `... - Fort Meade Campus` location, name score 97 → 71).
+- Coverage, against 2026-08-19: 19.5 min. Strong 9,702 → 9,665, ambiguous
+  8,406 → 8,453, no credible match 16,561 → 16,545 — **the totals barely move,
+  but 4,816 entities (9.9%) changed tier and 2,988 proposed ids changed.** Of the
+  402 that left the strong tier (365 entered it), 386 trace to Definitive data:
+  49 proposed ids no longer exist, 250 had their own locations change, 81 had a
+  rival's change, 7 renames or new rival records; 16 are unattributed. Strong-tier
+  `Matched_Via` stayed mostly `Name` (7,848 of 9,665).
+- Definitive churns faster than the xlsx era suggested: between the 2026-07-31
+  export and 2026-09-29, 10,508 of 258,004 location (id, name) pairs vanished
+  and 9,714 appeared; 4,916 parent ids lost every location and 5,155 gained
+  their first. **A coverage proposal list is only good against the Definitive
+  snapshot it came from** — re-run before loading an old one.
+
+## Run folders
+
+Every run writes **everything it produces into its own folder** under
+`Results Output/`, named for the program and the minute it started:
+
+```
+Results Output/
+  dhc_match_v2_2026_09_29_1422/            <- one accuracy run
+    dhc_match_v2_2026_09_29_1422_scored.csv
+    dhc_match_v2_2026_09_29_1422_unverifiable.csv
+    dhc_match_v2_2026_09_29_1422_zeus_extract.csv
+    dhc_match_v2_2026_09_29_1422_dhc_hospitaloverview.parquet
+    dhc_match_v2_2026_09_29_1422_dhc_hospitaloverview.sql
+    Zeus_DHC_ID_Accuracy_Audit_2026_09_29_1422.xlsx
+  dhc_gap_match_2026_09_29_1450/           <- one coverage run
+    ..._gap_candidates.csv, _gap_nomatch.csv, _zeus_extract.csv, _dhc_*.parquet
+    Zeus_DHC_ID_Coverage_Audit_2026_09_29_1450.xlsx
+```
+
+- `new_run_prefix()` in `dhc_match_v2.py` creates the folder; both run tools
+  call it. Every file inside is prefixed with the folder name, so a file copied
+  out still says which run wrote it. There is no `--out` prefix to choose any
+  more; `--label <x>` appends `_x` to the folder name (`--out` is still accepted
+  as an alias for it). Two runs in the same minute get `_2`, `_3`.
+- The workbook builders write **into the run folder they were given**, named for
+  that run's date and time (not today's), so `--out` is optional. A bare
+  `--out name.xlsx` still lands in the run folder; a path goes where it says.
+  Rebuilding an old run therefore overwrites its workbook, so pass `--out`
+  elsewhere to compare.
+- `--definitive-from` accepts a run folder as well as a prefix.
+- The whole folder is git-ignored (`Results Output/`), so one run folder is
+  the unit to archive to a governed store alongside a circulated deliverable.
+
+**Folders from before 2026-09-29 were moved in by hand** and keep their original
+file names. The folder time is when that run's Zeus extract was written, which
+is close to when it started:
+
+| Folder | Files | What it was |
+|---|---|---|
+| `dhc_match_v2_2026_07_30_1711` | `audit_2026_08_*` | File era. No extract, so the time is when it *finished* |
+| `dhc_match_v2_2026_07_31_1133` | `audit_2026_08_live_*` | First live run, Client-only, HQ-only |
+| `dhc_match_v2_2026_07_31_1601` | `audit_2026_08_all4_*` | Client-only, all four Definitive sources |
+| `dhc_match_v2_2026_08_12_1643` | `audit_2026_08_all6_*` | Six populations |
+| `dhc_match_v2_2026_08_12_1701` | `audit_2026_08_12_*` + its workbook | Six populations, re-run: the one the Results figures and `--claimed` come from |
+| `dhc_gap_match_2026_08_19_1239` | `gap_2026_08_19_*` + its workbook | First coverage run |
+
+`Zeus_DHC_ID_Accuracy_Audit.xlsx` stays in the project root: it is the reporting
+template, not a run's output.
 
 ## Producing a new audit summary
 
-Two commands. Set `TAG` to the run date, `YYYY_MM_DD`.
+Two commands. The first prints `Run folder  : Results Output/<run>`; the second
+takes that run's scored file.
 
 ```
-py dhc_match_v2.py run --config sources.yaml --out audit_<TAG>
+py dhc_match_v2.py run --config sources.yaml
 
-py build_audit_workbook.py --scored audit_<TAG>_scored.csv --config sources.yaml \
-    --out Zeus_DHC_ID_Accuracy_Audit_<TAG>.xlsx
+py build_audit_workbook.py --scored "Results Output/<run>/<run>_scored.csv"
 ```
 
 `--baseline <earlier>_scored.csv` is **optional**: it adds a section comparing
 this run against an earlier one on the entities common to both. Omit it and that
 section is left out entirely; nothing else changes.
 
-Step 1 writes `audit_<TAG>_scored.csv`, `_unverifiable.csv` and
-`_zeus_extract.csv`; step 2 turns them into the branded workbook. Roughly two to
+### One population only: `--population`
+
+Both workbook builders take `--population <label>` (a `zeus.sources` label —
+`WorkLocation`, `Client`, `HealthSystem`, ...; case and spaces ignored, so
+`"work location"` works). Every sheet, headline, total and identity is then
+limited to entities in that population, and the workbook is named
+`Zeus_DHC_ID_Accuracy_Audit_<label>_<run>.xlsx` (or `..._Coverage_Audit_...`),
+so it never overwrites the full one. Built 2026-09-29 for a third-party
+data-cleaning group working the Work Location subset:
+
+```
+py build_audit_workbook.py --scored "Results Output/<run>/<run>_scored.csv" \
+    --population WorkLocation
+py build_coverage_workbook.py --candidates ".../<run>_gap_candidates.csv" \
+    --accuracy ".../<accuracy run>_scored.csv" --population WorkLocation
+```
+
+It filters the run's **outputs, never the scoring**. A Work Location entity that
+is also a Client is still matched on every name and address it holds in any
+population (decision #10) — do not get the same effect by filtering the query
+instead: adding `e.IsClient = 0` to the Work Location queries was measured on
+2026-09-29 and moved 15 accuracy verdicts, all downward, added 6 false
+`Geo_Conflict` rows, and dropped 15 entities from both audits entirely (flagged
+`IsClient` with no active `ClientInfo` row). Membership means "flagged in that
+population", alone or alongside others: 10,047 Work Location entities carry an
+id, 5,946 of the 9,228 testable are also Clients. In the scoped accuracy
+workbook `Unreferenced_Definitive` means records none of *these* entities points
+at, and the coverage workbook's estate section (`--accuracy`) is scoped too.
+
+`Matched_Zeus_Source` says whether a result rests on the population's own name.
+On the Work Location subset it rarely does not: of the 5,946 testable Work
+Location entities that are also Clients, 159 verdicts rest on a name only the
+Client row holds.
+
+Step 1 writes `<run>_scored.csv`, `_unverifiable.csv`,
+`_zeus_extract.csv` and one `_dhc_<table>.parquet` per Databricks source; step
+2 turns them into the branded workbook in the same folder. Roughly two to
 three minutes end to end, most of it reading the 400k-row location export.
 
 Preconditions — all currently satisfied:
 
 - `ZEUS_SQL_PASSWORD` set at User scope. If it is missing the run stops
   immediately and names the variable.
-- The four `Definitive_*.xlsx` exports present in the working directory.
 - `pyodbc` plus ODBC Driver 17 or 18 installed.
+- A valid Databricks CLI login for profile `jcl` (`databricks auth profiles`
+  shows `Valid YES`), plus `databricks-sql-connector databricks-sdk pyarrow`.
 
 Check four things in the step-1 output before circulating anything:
 
@@ -142,7 +326,7 @@ Check four things in the step-1 output before circulating anything:
 4. In the workbook: testable + unverifiable = supplied, and the verdict counts
    sum to testable. Those two identities catch most wiring mistakes.
 
-**Keep `audit_<TAG>_zeus_extract.csv` with anything you circulate.** Zeus is a
+**Keep `<run>_zeus_extract.csv` with anything you circulate.** Zeus is a
 live moving target and the snapshot is the only way to reproduce a figure later.
 Verified: replaying it with `--zeus` reproduces the run exactly.
 
@@ -152,18 +336,18 @@ it has many rows per id (decision #9). When a **new Zeus population** is added,
 add a block under `zeus.sources` with that query's own column names; nothing
 else needs to change (decision #10).
 
-Every run writes `<out>_zeus_extract.csv`, a snapshot of the exact input it
+Every run writes `<run>_zeus_extract.csv`, a snapshot of the exact input it
 scored. Zeus is a live moving target and these snapshots are **not** in git (see
 "Version control"), so one is still the only way to reproduce a figure later —
 keep it with any results you circulate. The `--zeus` flag replays one offline.
 
 ## Producing a coverage run (the missing IDs)
 
-One command, same config, same `TAG` convention:
+One command, same config, its own run folder:
 
 ```
-py dhc_gap_match.py --config sources.yaml --out gap_<TAG> \
-    --claimed audit_<TAG>_scored.csv
+py dhc_gap_match.py --config sources.yaml \
+    --claimed "Results Output/<accuracy run>/<accuracy run>_scored.csv"
 ```
 
 `--claimed` is **optional**: point it at a scored accuracy run and every proposal
@@ -173,10 +357,14 @@ work-location entity legitimately share a Definitive record — but it is worth
 seeing before loading. `--zeus <extract.csv>` replays a snapshot offline, and
 `--limit N` scores the first N entities for a quick check.
 
-Writes `gap_<TAG>_gap_candidates.csv` (every entity with a credible proposal,
-best plus two alternates), `gap_<TAG>_gap_nomatch.csv`, and
-`gap_<TAG>_zeus_extract.csv`. **Keep the extract with anything you circulate**,
-for the same reason as the accuracy run. Roughly 20–30 minutes, most of it the
+Writes `<run>_gap_candidates.csv` (every entity with a credible proposal,
+best plus two alternates), `<run>_gap_nomatch.csv`, and
+`<run>_zeus_extract.csv`, plus the `<run>_dhc_<table>.parquet`
+Definitive snapshots, all in `Results Output/dhc_gap_match_<date>_<time>/`. The
+extract is written on a `--zeus` replay too, so a replayed run's folder is
+complete on its own. **Keep the extract and snapshots with anything you
+circulate**, for the same reason as the accuracy run; `--definitive-from`
+replays the snapshots. Roughly 20–30 minutes, most of it the
 400k-row location export and the exact-scoring pass.
 
 The output columns that carry the reasoning, and which reviewers need:
@@ -184,7 +372,13 @@ The output columns that carry the reasoning, and which reviewers need:
 | Column | What it answers |
 |---|---|
 | `Match_Tier` | The verdict. See decision #11 for what each tier requires |
-| `Matched_Zeus_Name` / `Matched_Definitive_Name` | **Which two strings actually matched.** Not the same as `Zeus_Name` / `Suggested_Name`: pooling means the winning Zeus name may not be the first one, and the winning Definitive string may be an alias or a service location |
+| `Matched_Zeus_Name` / `Matched_Definitive_Name` | **Which two strings actually matched.** Not the same as `Zeus_Name` / `Suggested_Name`: pooling means the winning Zeus name may not be the first one, and the winning Definitive string may be an alias or a service location. The accuracy output carries the same four `Matched_*` columns since 2026-09-29, from the shared `name_provenance()` in `dhc_match_v2.py`; the pair reproduces `Name_Score` exactly |
+| `Matched_Zeus_Source` | Which Zeus population(s) hold the winning Zeus name, e.g. `Client` or `Client\|WorkLocation`. Built in `_pool()`, which records each name's populations |
+| `Matched_Zeus_Address/City/State/Zip`, `Matched_Definitive_Address/City/State/Zip` | **The address pair that produced the street scores**, each line with its own place. Added 2026-09-29, both tools. Not the same as `Zeus_Address` (the first pooled address) or the Definitive HQ: where `Address_Match_Source = Location` the Definitive side is a service location — e.g. Zeus `317 Martin Luther King Jr Way, Tacoma` scoring 100 against a satellite whose HQ is `305 S L St`. `addr_scores()` returns the winning Zeus line, `enriched_scores()` an 8th provenance element, and `location_index()` / `_pool()` keep an address → (city, state, zip) map. The pair reproduces `StreetNum_Score` / `StreetName_Score` exactly. `City_Score` and `Zip_Score` are still taken across every known site, so they can agree where the matched pair's city does not |
+| `Suggested_Address/City/State/Zip` (coverage) / `DHC_Addr1`, `DHC_City`, `DHC_State`, `DHC_Zip` (accuracy) | The Definitive record's HQ, for reference beside the matched pair. Both are on every review sheet, next to the Zeus columns |
+| `Zeus_Phones`, `Suggested_Phone` / `DHC_Phone`, `Phone_Match`, `Matched_Phone` | Decision #14. `Phone_Match` is True / False / blank for the proposed (or supplied) id; blank is absence of evidence, not disagreement |
+| `Phone_Favours_Alt`, `Alt1_Phone_Match`, `Alt2_Phone_Match` (coverage) | Exactly one of the three candidates shares the entity's number and it is a runner-up. Sheet `Phone_Favours_Alt` |
+| `Phone_Lookup_DHC_Id` / `Phone_Lookup_Name`, `Phone_Points_Elsewhere` | The one Definitive record holding the entity's number, whatever the name says. On the coverage no-match file this is sheet `Phone_Only_Match` (leads the name search missed); on the accuracy unverifiable file it is the only lead an unmatched id has (517 of 1,705 on 2026-09-29); `Phone_Points_Elsewhere` (accuracy) is a supplied id whose number belongs to someone else |
 | `Matched_Via` | `Name`, `Alias` or `Location`. `Location` means Definitive lists your entity as a service location of the proposed parent — the ID is the **parent's**, which is usually what you want but should be understood before loading |
 | `Match_Margin` | Distance to the runner-up. Below 3 the tier is forced to `Ambiguous` |
 | `Same_Name_Rivals` | How many other candidates matched the name about as well |
@@ -194,9 +388,9 @@ The output columns that carry the reasoning, and which reviewers need:
 Then build the deliverable:
 
 ```
-py build_coverage_workbook.py --candidates gap_<TAG>_gap_candidates.csv \
-    --config sources.yaml --accuracy audit_<TAG>_scored.csv \
-    --out Zeus_DHC_ID_Coverage_Audit_<TAG>.xlsx
+py build_coverage_workbook.py \
+    --candidates "Results Output/<run>/<run>_gap_candidates.csv" \
+    --accuracy "Results Output/<accuracy run>/<accuracy run>_scored.csv"
 ```
 
 `--accuracy` is **optional**: it adds a whole-estate coverage section to the
@@ -230,13 +424,15 @@ The folder is a git repo with a **private** GitHub remote,
 `GrantJCLT/Zeus-DHC-Ids-to-Definitive-Source-Fuzzy-Matching`. Keep it private:
 the history contains licensed Definitive exports and Zeus client records.
 
-Only source is tracked — the two scripts, `sources.yaml`, the three `.sql` files,
-this file, and `.gitignore`. Everything else is deliberately ignored:
+Only source is tracked — the four scripts, `sources.yaml`, the sixteen `.sql`
+files (twelve Zeus, four Definitive), this file, `Usage.md`, `Environment.md`,
+the business overview, and `.gitignore`. Everything else is deliberately ignored:
 
 | Ignored | Why |
 |---|---|
 | `Definitive_*.xlsx` | Licensed third-party data. A git remote is redistribution — confirm terms with the licence owner before these leave this machine. |
-| `audit_*_scored.csv`, `audit_*_unverifiable.csv`, `audit_*_zeus_extract.csv` | Zeus client names and addresses. Regenerable from the query plus `sources.yaml`. |
+| `Results Output/` | Every run folder: Zeus client names and addresses, Definitive snapshots, workbooks. The suffix rules (`*_scored.csv`, `*_zeus_extract.csv`, …) remain as a backstop for anything written outside it. |
+| `*_dhc_*.parquet` | Per-run snapshots of the Databricks-held Definitive tables — the same licensed data as the xlsx exports. |
 | `Zeus_DHC_ID_Accuracy_Audit*.xlsx` | Generated by `build_audit_workbook.py`. |
 | `__pycache__/`, `.env`, `*.local.yaml` | Artifacts and secrets. |
 
@@ -259,7 +455,7 @@ Two consequences worth knowing:
 ## Results
 
 Six Zeus populations against all four Definitive sources, 2026-08-12
-(`audit_2026_08_all6_*`). 19,820 population rows pooled to **12,803 distinct
+(`Results Output/dhc_match_v2_2026_08_12_1701/audit_2026_08_12_*`). 19,820 population rows pooled to **12,803 distinct
 entities**; 11,099 testable (86.7%); 202,586 reference records.
 
 **The headline is now stated over the whole population**, not just the testable
@@ -343,7 +539,7 @@ regenerated.
 
 ## Coverage results
 
-First coverage run, 2026-08-19 (`gap_2026_08_19_*`), against the same four
+First coverage run, 2026-08-19 (`Results Output/dhc_gap_match_2026_08_19_1239/`), against the same four
 Definitive sources. 54,242 population rows pooled to **48,739 distinct entities
 carrying no Definitive identifier** — measured with `--claimed` against the
 2026-08-12 accuracy run. 23.7 minutes end to end.
@@ -552,6 +748,30 @@ naive alternative was measurably wrong.
     satellite (`Dartmouth Hitchcock - Bedford` → Dartmouth-Hitchcock, address
     100) from a coincidence.
 
+14. **Phone is a third signal, reported beside `Verdict` and `Match_Tier`,
+    never folded into them** (added 2026-09-29). Zeus holds phones in each
+    population's `*InfoPhone` table (`Zeus entity phones.sql`, one query for all
+    six, labelled by population and stored in the Zeus extract as `Z_Phones`);
+    Definitive holds them on every HQ and service location (the `phone:` role).
+    Numbers are normalised to 10 digits (`norm_phones()`); any number held by
+    `PHONE_SHARED_MIN` = 5 or more Definitive ids — 3,079 of them, scheduling
+    lines and switchboards — identifies nothing. `Phone_Match` is True when a
+    non-shared number agrees, False when both sides hold non-shared numbers and
+    none agree, and **blank otherwise, including when the only overlap is a
+    shared number**. That last rule matters: treating a shared-number overlap
+    as disagreement dropped confirmed-row agreement from 92.4% to 87.1%.
+    Measured 2026-09-29 on the live population: 12,438 of 12,803 id-carrying
+    entities have a usable phone; on confirmed rows the numbers agree 92.4%
+    (8,979 of 9,715); 56 of 117 `Needs review` rows agree; 127 rows carry a
+    number that belongs to exactly one *other* record (`Phone_Points_Elsewhere`).
+    Kept out of the verdict and the tiers because decisions #4 and #11 define
+    those on name and address, and a phone can be stale or a shared office
+    line — `Phone_Lookup` proposed `Source Chiropractic` for `Clarksville Ob
+    Gyn Associates`. Promoting or demoting on phone is a separate decision to
+    take once the flagged rows have been reviewed; adding it changed no
+    existing value (verified by replaying the same extract with phones
+    stripped).
+
 ## Reporting template
 
 `Zeus_DHC_ID_Accuracy_Audit.xlsx` is retained for its **shape**, which is the
@@ -584,10 +804,12 @@ Latest deliverables: **`Zeus_DHC_ID_Accuracy_Audit_2026_08_12.xlsx`** from the
 2026-08-12 six-population run, and
 **`Zeus_DHC_ID_Coverage_Audit_2026_08_19.xlsx`** from the 2026-08-19 gap run.
 The coverage workbook follows the same template applied to the complement
-question — see "Producing a coverage run" for its twelve sheets. Both are
+question — see "Producing a coverage run" for its twelve sheets. Each lives in
+its run's folder (`dhc_match_v2_2026_08_12_1701` and
+`dhc_gap_match_2026_08_19_1239`). Both are
 ignored by git (`Zeus_DHC_ID_*.xlsx`); they carry Zeus client names and
-addresses. Name deliverables with the **run date**
-(`_YYYY_MM_DD`), not the month — Zeus is live, so two runs in one month are
+addresses. The builders name deliverables with the **run date and time**
+(`_YYYY_MM_DD_HHMM`) by default, not the month — Zeus is live, so two runs in one month are
 different populations and a month-only name silently overwrites one with the
 other.
 
@@ -708,7 +930,7 @@ variants (`Southpoint Anesthesia LLC` → `Southpoint Anesthesia Services LLC`;
 **1. ~~Widen the reference set.~~ Largely moot now.** Both exports are in and
 configured. On the live population 83.5% of rows are already testable (7,659 of
 9,171), so the remaining 1,512 unverifiable rows are a small target — check
-`audit_2026_08_live_unverifiable.csv` before buying another export. Licensing
+`Results Output/dhc_match_v2_2026_07_31_1133/audit_2026_08_live_unverifiable.csv` before buying another export. Licensing
 note: confirm redistribution terms with whoever owns the Definitive licence
 before exporting a full universe.
 

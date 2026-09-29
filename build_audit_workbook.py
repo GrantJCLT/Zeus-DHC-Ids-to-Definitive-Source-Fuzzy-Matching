@@ -8,11 +8,16 @@ reporting template. Two deliberate additions over that original:
     highest-value review population;
   * Unreferenced_Definitive is generated rather than hand-built.
 
-  py build_audit_workbook.py --scored audit_2026_08_all4_scored.csv \
-      --config sources.yaml --out Zeus_DHC_ID_Accuracy_Audit_2026_08.xlsx
+  py build_audit_workbook.py --scored "Results Output/<run>/<run>_scored.csv"
+
+The workbook is written into the run's own folder, beside the files it was
+built from, as Zeus_DHC_ID_Accuracy_Audit_<run date and time>.xlsx. `--out`
+overrides the name; a bare file name still lands in the run folder.
 """
 import argparse
 import os
+import re
+import time
 
 import numpy as np
 import pandas as pd
@@ -21,12 +26,75 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from dhc_match_v2 import load_config, load_definitive, load_locations, \
-    locations_as_identity, _read_roles
+    locations_as_identity, materialise_tables, _read_roles
 
 # Brand palette, lifted from the template.
 NAVY, PURPLE = 'FF004065', 'FF8247AF'
 INK, GREY = 'FF2D2A26', 'FF959492'
 CREAM, LILAC = 'FFFEF9E5', 'FFEFE7F7'
+
+
+def workbook_path(prefix, stem, out=None):
+    """Where a run's workbook goes: inside that run's folder, by default.
+
+    Named for the run's own date and time (read off the prefix), not today's,
+    so rebuilding an old run's workbook does not mislabel it.
+    """
+    folder = os.path.dirname(prefix)
+    if out:
+        return out if os.path.dirname(out) else os.path.join(folder, out)
+    m = re.search(r'\d{4}_\d{2}_\d{2}(?:_\d{4})?', os.path.basename(prefix))
+    return os.path.join(folder, f'{stem}_'
+                        f'{m.group(0) if m else time.strftime("%Y_%m_%d")}.xlsx')
+
+
+def resolve_population(label, frames):
+    """The canonical population label for --population, from the run itself.
+
+    Matched ignoring case and spaces, so 'Work Location' finds 'WorkLocation'.
+    Labels come from the runs' Zeus_Sources, i.e. from sources.yaml.
+    """
+    labels = sorted({x for df in frames if df is not None
+                     and 'Zeus_Sources' in df.columns
+                     for v in df.Zeus_Sources.dropna()
+                     for x in str(v).split('|')})
+    hit = [x for x in labels
+           if x.lower() == re.sub(r'\s+', '', label).lower()]
+    if not hit:
+        raise SystemExit(f'--population {label!r} is not in this run; '
+                         f'choose one of {labels}')
+    return hit[0]
+
+
+def in_population(df, label):
+    """Rows whose entity belongs to `label` - alone or alongside others."""
+    return df.Zeus_Sources.astype(str).str.split('|').map(lambda v: label in v)
+
+
+def extract_in_population(z, label):
+    """Every extract row of the entities in `label`, other populations included,
+    so row counts still describe what those entities were pooled from."""
+    ids = set(z.loc[z.Zeus_Source == label, 'EntityId'])
+    return z[z.EntityId.isin(ids)]
+
+
+def population_title(label):
+    """'WorkLocation' -> 'Work Location', for prose."""
+    return re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', label)
+
+
+def scope_note(label, n, n_all, noun):
+    """The Methodology row a population-scoped workbook leads with."""
+    t = population_title(label)
+    return (f'Scope: {t} entities only',
+            f'Every figure and sheet in this workbook is limited to the {n:,} '
+            f'{noun} flagged {t} (of {n_all:,} in the run). Scoring is '
+            f'unchanged by the scope: an entity that is also, say, a Client was '
+            f'matched on every name and address it holds in any population, so '
+            f'a result can rest on its Client name rather than its {t} one - '
+            f'Matched_Zeus_Source says which. The "By Zeus population" table '
+            f'shows which other populations these same entities belong to.')
+
 
 H1 = Font(size=16, bold=True, color='FFFFFFFF')
 H2 = Font(size=11, color='FFFFFFFF')
@@ -98,7 +166,7 @@ def sheet_data(wb, title, df, widths=None):
 
 
 def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle,
-                  overall):
+                  overall, population=None, phone_rows=None):
     ws = wb.create_sheet('Summary')
     for col, w in zip('ABCDE', (4, 62, 16, 14, 60)):
         ws.column_dimensions[col].width = w
@@ -114,8 +182,9 @@ def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle,
     total = funnel['testable']
     zeus = funnel['zeus']
     corr = verdicts.get('ID corroborated', 0)
+    kind = f'{population_title(population)} ' if population else ''
     _put(ws, 'B5',
-         f'Zeus holds {zeus:,} distinct objects carrying a Definitive '
+         f'Zeus holds {zeus:,} distinct {kind}objects carrying a Definitive '
          f'identifier. {corr:,} of them ({corr / zeus:.1%}) are confirmed to '
          f'point at the right Definitive record, matched on name and address; a '
          f'further {overall["probable"]:,} ({overall["probable"] / zeus:.1%}) '
@@ -130,8 +199,8 @@ def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle,
          BODY, FILL_CREAM, align=WRAP)
 
     r = 9
-    _put(ws, f'B{r}', 'Accuracy across every Zeus object carrying an identifier',
-         SECTION)
+    _put(ws, f'B{r}', f'Accuracy across every Zeus {kind}object carrying an '
+                      f'identifier', SECTION)
     _put(ws, f'B{r + 1}',
          'The direct answer to "how accurate are our Definitive identifiers". '
          'Denominator is every object with an identifier, so the untestable '
@@ -164,19 +233,35 @@ def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle,
 
     if by_pop:
         _put(ws, f'B{r}', '4. By Zeus population', SECTION)
-        _put(ws, f'B{r + 1}', 'Populations overlap - an entity that is both a '
-                              'client and a work location is counted in each, '
-                              'so these rows sum to more than the testable '
-                              'total. Its names and addresses from every '
-                              'population are pooled into one verdict.', NOTE)
+        _put(ws, f'B{r + 1}', (
+            f'Every row here is a {population_title(population)} entity; the '
+            f'other rows count those that ALSO belong to that population. '
+            f'Their names and addresses from every population are pooled into '
+            f'one verdict.') if population else (
+            'Populations overlap - an entity that is both a client and a work '
+            'location is counted in each, so these rows sum to more than the '
+            'testable total. Its names and addresses from every population are '
+            'pooled into one verdict.'), NOTE)
         r = _table(ws, r + 2,
                    ['Zeus population', 'Testable', 'Corroborated', 'Share'],
                    by_pop)
 
+    if phone_rows:
+        _put(ws, f'B{r}', '5. Phone check on the identifier', SECTION)
+        _put(ws, f'B{r + 1}', 'Independent of the verdict, which rests on name '
+                              'and address only. "Agrees" means a Zeus phone '
+                              'equals a number Definitive holds for the record (HQ or any '
+                              'service location); "points elsewhere" means it '
+                              'does not, and the number belongs to exactly one '
+                              'OTHER Definitive record. Numbers shared by 5 or '
+                              'more records are ignored.', NOTE)
+        r = _table(ws, r + 2, ['Verdict', 'Rows', 'Phone on both sides',
+                               'Phone agrees', 'Points elsewhere'], phone_rows)
+
     # Only when a --baseline was supplied. Without one there is nothing to
     # compare, and an empty table under a heading reads like missing data.
     if gains:
-        _put(ws, f'B{r}', '5. What the enrichment contributed', SECTION)
+        _put(ws, f'B{r}', '6. What the enrichment contributed', SECTION)
         _put(ws, f'B{r + 1}', 'Two changes since the baseline run, so this delta '
                               'is their combined effect: Definitive service '
                               'locations mean a Zeus address is compared against '
@@ -211,7 +296,12 @@ def main():
     ap.add_argument('--config', default='sources.yaml')
     ap.add_argument('--baseline', help='earlier HQ-only scored csv, for the '
                                       'location-gain comparison')
-    ap.add_argument('--out', required=True)
+    ap.add_argument('--out', help='workbook name (default: in the run folder, '
+                                  'named for the run date)')
+    ap.add_argument('--population', metavar='LABEL',
+                    help='limit the workbook to entities in one Zeus population '
+                         '(a sources.yaml label, e.g. WorkLocation); scoring '
+                         'is unchanged')
     a = ap.parse_args()
 
     s = pd.read_csv(a.scored, low_memory=False)
@@ -221,7 +311,26 @@ def main():
     z = pd.read_csv(extract, low_memory=False) if os.path.exists(extract) else None
     u = pd.read_csv(unver, low_memory=False) if os.path.exists(unver) else None
 
+    pop = None
+    if a.population:
+        # Filter the run's outputs, not the scoring: every entity was matched on
+        # all its names and addresses, and a scoped workbook keeps those results.
+        pop = resolve_population(a.population, [s, u])
+        n_all = len(s) + (len(u) if u is not None else 0)
+        s = s[in_population(s, pop)]
+        if u is not None:
+            u = u[in_population(u, pop)]
+        if z is not None:
+            z = extract_in_population(z, pop)
+        print(f'Population  : {pop} - {len(s) + (len(u) if u is not None else 0):,}'
+              f' of {n_all:,} entities')
+    a.out = workbook_path(prefix, 'Zeus_DHC_ID_Accuracy_Audit' +
+                          (f'_{pop}' if pop else ''), a.out)
+
     cfg = load_config(a.config)
+    # Databricks sources are live; read the run's own snapshot so the workbook
+    # describes the reference data that was actually scored.
+    materialise_tables(cfg, prefix, replay=True)
     # The extract holds one row per population per entity; the audit's grain is
     # the entity, so the funnel must count distinct EntityIds, not extract rows.
     zeus_rows = (int(z.EntityId.nunique()) if z is not None and 'EntityId' in z
@@ -343,6 +452,17 @@ def main():
             ok = int((s[m].Verdict == 'ID corroborated').sum())
             by_pop.append([lab, n_, ok, ok / n_ if n_ else 0.0])
 
+    phone_rows = []
+    if 'Phone_Match' in s.columns:
+        pm = s.Phone_Match.map({True: True, False: False, 'True': True,
+                                'False': False})
+        pe = s.Phone_Points_Elsewhere.map({True: True, 'True': True}).fillna(False)
+        for v in [x[0] for x in verdicts['rows']] + ['All testable']:
+            m = s.Verdict.eq(v) if v != 'All testable' else s.Verdict.notna()
+            both = int(pm[m].notna().sum())
+            phone_rows.append([v, int(m.sum()), both, int(pm[m].eq(True).sum()),
+                               int(pe[m].sum())])
+
     gains = []
     if a.baseline and os.path.exists(a.baseline):
         b = pd.read_csv(a.baseline, low_memory=False)
@@ -374,20 +494,27 @@ def main():
                  'Impossible before service locations were available.'),
         ]
 
-    subtitle = ('Six Zeus populations (Client, Work Location, Health System, '
-                'GPO, Agency, VMS) vs. Definitive Hospital, Physician Group, '
-                'GPO and Practice Location exports  |  read live from the '
-                'read-only replica')
+    subtitle = ((f'{population_title(pop)} entities only  |  ' if pop else
+                 'Six Zeus populations (Client, Work Location, Health System, '
+                 'GPO, Agency, VMS)  |  ') +
+                'vs. Definitive Hospital, Physician Group, GPO and Practice '
+                'Location data  |  read live from the read-only replica')
 
     wb = Workbook()
     wb.remove(wb.active)
     build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle,
-                  overall)
-    build_methodology(wb, [
+                  overall, pop, phone_rows)
+    scope = []
+    if pop:
+        head, text = scope_note(pop, zeus_rows, n_all, 'entities')
+        scope = [(head, text + ' Unreferenced_Definitive lists the Definitive '
+                  'records none of these entities points at, so it includes '
+                  'records that entities outside this scope do reference.')]
+    build_methodology(wb, scope + [
         ('Source of truth', 'Zeus is read live from the failover replica with '
          'ApplicationIntent=ReadOnly; the run asserts the database is '
          'READ_ONLY. Every run snapshots its exact input to '
-         '<out>_zeus_extract.csv.'),
+         '<run>_zeus_extract.csv.'),
         ('Six populations, pooled', 'Zeus is read through six queries - '
          'IsClient, IsWorkLocation, IsHealthSystem, IsGPO, IsAgency, IsVMS - '
          'each reading its own *Info table and so its own column names. 6,855 '
@@ -437,12 +564,50 @@ def main():
          'in different places. Name agreement proves the two sides mean the '
          'same NAME, not necessarily the same ENTITY. Closing that needs a '
          'human or a third identifier such as NPI.'),
+        ('Read Matched_Zeus_Name and Matched_Zeus_Source', 'The Zeus name that '
+         'produced Name_Score, and the population(s) holding it. Pooling means '
+         'it need not be Zeus_Name: an entity that is both a Client and a Work '
+         'Location may be scored on either name. Matched_Definitive_Name is '
+         'the Definitive string it matched and Matched_Via says whether that '
+         'was the record name, a parenthetical alias or a service location.'),
+        ('Phone is a third signal, reported not scored', 'Zeus phones come '
+         'from the *InfoPhone table of each population; Definitive phones from the '
+         'record HQ and every service location. Numbers are normalised to 10 '
+         'digits and any number held by 5 or more Definitive records (a '
+         'central scheduling line or switchboard) is ignored. Phone_Match is '
+         'blank when either side has no usable number - absence of evidence, '
+         'not disagreement. It does not change Verdict. Phone_Points_Elsewhere '
+         'is the case to review: the number belongs to exactly one OTHER '
+         'record, named in Phone_Lookup_DHC_Id / Phone_Lookup_Name. On the '
+         'unverifiable file Phone_Lookup_* is the only lead an unmatched id '
+         'has.'),
+        ('Two Definitive addresses on every row', 'DHC_Addr1, DHC_City, '
+         'DHC_State and DHC_Zip are where Definitive says the record is '
+         'headquartered. Matched_Zeus_Address and Matched_Definitive_Address '
+         'are the pair that produced the street scores, each with its own '
+         'city, state and zip - where Address_Match_Source is Location the '
+         'Definitive side is a service location of the record, not its HQ. '
+         'City_Score and Zip_Score are still taken across every known site, so '
+         'they can agree where the matched pair\'s city does not.'),
     ])
 
+    # Zeus, then the Definitive record's HQ, then the pairs that actually
+    # scored - side by side, so a reviewer compares like with like. The HQ is
+    # not always what matched: Address_Match_Source = Location means the
+    # Matched_Definitive_* address is a satellite.
     show = [c for c in ['EntityId', 'Zeus_Sources', 'Zeus_Name',
                         'Zeus_Names_All', 'Zeus_Address', 'Zeus_City',
-                        'Zeus_State', 'Zeus_Zip', 'DHC_Id', 'DHC_Matched_Name',
-                        'DHC_Entity_Type', 'DHC_City', 'DHC_State',
+                        'Zeus_State', 'Zeus_Zip', 'Zeus_Phones', 'DHC_Id',
+                        'DHC_Matched_Name', 'DHC_Entity_Type', 'DHC_Addr1',
+                        'DHC_City', 'DHC_State', 'DHC_Zip', 'DHC_Phone',
+                        'Phone_Match', 'Matched_Phone', 'Phone_Points_Elsewhere',
+                        'Phone_Lookup_DHC_Id', 'Phone_Lookup_Name',
+                        'Matched_Zeus_Name', 'Matched_Zeus_Source',
+                        'Matched_Definitive_Name', 'Matched_Via',
+                        'Matched_Zeus_Address', 'Matched_Zeus_City',
+                        'Matched_Zeus_State', 'Matched_Zeus_Zip',
+                        'Matched_Definitive_Address', 'Matched_Definitive_City',
+                        'Matched_Definitive_State', 'Matched_Definitive_Zip',
                         'Name_Score', 'Address_Score', 'State_Score',
                         'Address_Match_Source', 'Location_Count', 'Verdict',
                         'Suggested_DHC_Id', 'Suggested_Name',
@@ -461,6 +626,11 @@ def main():
     if 'Correction_Recommended' in s.columns:
         cr = s[s.Correction_Recommended.fillna(False).astype(bool)]
         sheet_data(wb, 'Corrections_Recommended', cr[show])
+    if 'Phone_Points_Elsewhere' in s.columns:
+        pe = s[s.Phone_Points_Elsewhere.map({True: True, 'True': True})
+               .fillna(False).astype(bool)]
+        sheet_data(wb, 'Phone_Points_Elsewhere',
+                   pe[show].sort_values(['Verdict', 'Name_Score']))
 
     dup = s[s.DHC_Id.duplicated(keep=False)].sort_values(['DHC_Id', 'EntityId'])
     sheet_data(wb, 'Duplicate_IDs', dup[show])

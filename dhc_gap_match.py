@@ -23,13 +23,17 @@ rule this tool must NOT inherit is decision #4, "name outranks address":
     winner that a rival record matches equally well (`Ambiguous`).
 
 Usage:
-    py dhc_gap_match.py --config sources.yaml --out gap_2026_08_19
-    py dhc_gap_match.py --config sources.yaml --zeus <extract.csv> --out ...
-    py dhc_gap_match.py --config sources.yaml --claimed audit_2026_08_12_scored.csv ...
+    py dhc_gap_match.py --config sources.yaml
+    py dhc_gap_match.py --config sources.yaml --zeus <extract.csv>
+    py dhc_gap_match.py --config sources.yaml --claimed <accuracy run>_scored.csv
 
-Writes <out>_gap_candidates.csv (one row per Zeus entity, best proposal plus two
-alternates), <out>_gap_nomatch.csv, and <out>_zeus_extract.csv - keep that last
-one with anything you circulate, for the reason given in CLAUDE.md.
+Each run gets its own folder, "Results Output/dhc_gap_match_<YYYY_MM_DD_HHMM>/",
+and every file in it is prefixed with the folder name (<run> below).
+
+Writes <run>_gap_candidates.csv (one row per Zeus entity, best proposal plus two
+alternates), <run>_gap_nomatch.csv, <run>_zeus_extract.csv and one
+<run>_dhc_<table>.parquet per Databricks source - keep the extract and the
+snapshots with anything you circulate, for the reason given in CLAUDE.md.
 """
 import argparse
 import os
@@ -320,40 +324,10 @@ def location_index_capped(L, need_ids):
         M.LOC_CAP = saved
 
 
-def name_provenance(z_names, primary, aliases, loc_names):
-    """Which strings produced the winning name score, and how.
-
-    M.name_score returns a maximum over Zeus names x (primary, aliases,
-    location names), in both full-string and noise-stripped-core form. That is
-    the right score but it hides its own reasoning, and here the reasoning
-    decides the tier: a match on the entity's own name is identity evidence,
-    while a match on a service location's name is evidence about a satellite
-    and needs the address to confirm which entity owns it.
-
-    Returns (score, zeus_text, definitive_text, via, core_tokens) where `via` is
-    Name | Alias | Location and `core_tokens` counts the tokens in the winning
-    Definitive core - 1 means a generic single word, the case CLAUDE.md's
-    "How name_core behaves on practices" section warns about.
-    """
-    cands = [(primary, 'Name')] + [(a, 'Alias') for a in (aliases or [])] + \
-            [(n, 'Location') for n in (loc_names or [])]
-    best = (0.0, '', '', '', 0)
-    for zn in z_names:
-        zf, zc = M._clean(zn), M.name_core(zn)
-        for dn, via in cands:
-            if not dn:
-                continue
-            df_, dc = M._clean(dn), M.name_core(dn)
-            s = M.pair_score(zf, df_)
-            core_used = False
-            if zc and dc:
-                sc = M.pair_score(zc, dc)
-                if sc > s:
-                    s, core_used = sc, True
-            if s > best[0]:
-                best = (float(s), zn, dn, via,
-                        len((dc if core_used else df_).split()))
-    return best
+# Single-sourced in dhc_match_v2 since the accuracy audit reports it too. Here
+# the reasoning also decides the tier: a match on a service location's name is
+# evidence about a satellite and needs the address to confirm who owns it.
+name_provenance = M.name_provenance
 
 
 COLS_B = ['ent', 'Suggested_DHC_Id', 'Suggested_Name', 'Suggested_Entity_Type',
@@ -361,7 +335,7 @@ COLS_B = ['ent', 'Suggested_DHC_Id', 'Suggested_Name', 'Suggested_Entity_Type',
           'City_Score', 'State_Score', 'Zip_Score', 'Address_Match_Source',
           'Address_Score', 'Match_Score', 'Location_Count',
           'Matched_Zeus_Name', 'Matched_Definitive_Name', 'Matched_Via',
-          'Matched_Core_Tokens']
+          'Matched_Core_Tokens'] + M.MATCHED_ADDR_COLS
 
 BLEND_ORDER = ('name', 'stnum', 'stname', 'city', 'state', 'zip')
 
@@ -385,6 +359,7 @@ def score_exact(z, d, L, retrieved, dropped):
     row_of_id = {int(v): i for i, v in enumerate(dd.DHC_Id)}
     zn = list(z.Z_Names_U)
     za = list(z.Z_Addrs)
+    zg = list(z.Z_Addr_Geo)
     zc = list(z.Z_Cities_N)
     zs = list(z.Z_States_N)
     zz = list(z.Z_Zips_N)
@@ -405,7 +380,7 @@ def score_exact(z, d, L, retrieved, dropped):
                 ent = {'primary': p.d_primary, 'aliases': p.d_aliases,
                        'lines': (p.DHC_Addr1, p.DHC_Addr2), 'city': p.d_city_n,
                        'state': p.d_state, 'zip': p.d_zip5}
-                nm, an, ab, cs, st, zp, src = M.enriched_scores(
+                nm, an, ab, cs, st, zp, src, prov = M.enriched_scores(
                     zn[e], za[e], zc[e], zs[e], zz[e], ent, lc)
                 _, ztxt, dtxt, via, ctok = name_provenance(
                     zn[e], p.d_primary, p.d_aliases, lc['names'] if lc else [])
@@ -414,7 +389,9 @@ def score_exact(z, d, L, retrieved, dropped):
                     nm, an, ab, cs, st, zp, src,
                     M.weighted([an, ab, cs, st, zp], M.ADDR_W),
                     M.weighted([nm, an, ab, cs, st, zp], bw),
-                    (loc.get(did) or {}).get('n', 0), ztxt, dtxt, via, ctok))
+                    (loc.get(did) or {}).get('n', 0), ztxt, dtxt, via, ctok,
+                    *M.matched_address(prov, zg[e],
+                                       (p.DHC_City, p.DHC_State, p.DHC_Zip))))
         print(f'    scored {min(a + BATCH, len(ents)):>7,} of {len(ents):,} '
               f'entities', flush=True)
     if capped_total:
@@ -479,21 +456,26 @@ def flatten(o):
     o['Zeus_City'] = [' | '.join(v) for v in o.Z_Cities]
     o['Zeus_State'] = [' | '.join(v) for v in o.Z_States]
     o['Zeus_Zip'] = [' | '.join(str(x) for x in v) for v in o.Z_Zips]
+    o['Zeus_Phones'] = [' | '.join(v) for v in o.Z_Phones]
     return o.drop(columns=[c for c in
                            ['Z_Names', 'Z_Addrs', 'Z_Cities', 'Z_States',
-                            'Z_Zips', 'Z_Names_U', 'Z_Cities_N', 'Z_States_N',
+                            'Z_Zips', 'Z_Phones', 'Z_Names_U', 'Z_Name_Sources',
+                            'Z_Addr_Geo', 'Z_Cities_N', 'Z_States_N',
                             'Z_Zips_N', 'Entity_DHC_VerifiedSourceId',
                             'LEVS_DHC_VerifiedSourceId'] if c in o.columns])
 
 
 LEAD = ['EntityId', 'Zeus_Sources', 'Zeus_Source_Count', 'Match_Tier',
         'Zeus_Name', 'Zeus_Names_All', 'Zeus_Address', 'Zeus_Addresses_All',
-        'Zeus_City', 'Zeus_State', 'Zeus_Zip', 'Suggested_DHC_Id',
-        'Suggested_Name', 'Suggested_Entity_Type',
-        'Suggested_Status_Note', 'Name_Score',
+        'Zeus_City', 'Zeus_State', 'Zeus_Zip', 'Zeus_Phones',
+        'Suggested_DHC_Id', 'Suggested_Name', 'Suggested_Entity_Type',
+        'Suggested_Address', 'Suggested_City', 'Suggested_State',
+        'Suggested_Zip', 'Suggested_Phone', 'Suggested_Status_Note',
+        'Phone_Match', 'Matched_Phone', 'Phone_Favours_Alt',
+        'Phone_Lookup_DHC_Id', 'Phone_Lookup_Name', 'Name_Score',
         'Address_Score', 'Match_Score', 'Match_Margin', 'Same_Name_Rivals',
-        'Exact_Name_And_Geo', 'Matched_Zeus_Name', 'Matched_Definitive_Name',
-        'Matched_Via']
+        'Exact_Name_And_Geo', 'Matched_Zeus_Name', 'Matched_Zeus_Source',
+        'Matched_Definitive_Name', 'Matched_Via'] + M.MATCHED_ADDR_COLS
 
 
 def main():
@@ -501,15 +483,23 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--config', required=True)
-    ap.add_argument('--out', default='dhc_gap')
+    ap.add_argument('--label', '--out', dest='label',
+                    help='optional suffix for the run folder name; the folder '
+                         f'is always "{M.RESULTS_DIR}/dhc_gap_match_<date>_<time>"')
+    ap.add_argument('--results-dir', default=M.RESULTS_DIR)
     ap.add_argument('--zeus', help='replay an archived _zeus_extract.csv')
     ap.add_argument('--claimed', help='a <prefix>_scored.csv from '
                     'dhc_match_v2.py, to flag proposals whose id some other '
                     'Zeus entity already points at')
     ap.add_argument('--limit', type=int, help='first N entities only (testing)')
+    ap.add_argument('--definitive-from', metavar='PREFIX',
+                    help='reuse the Databricks snapshots of an earlier run '
+                         '(<PREFIX>_dhc_*.parquet, or that run folder) '
+                         'instead of querying live')
     a = ap.parse_args()
 
     t_start = time.time()
+    prefix = M.new_run_prefix('dhc_gap_match', a.label, a.results_dir)
     cfg = M.load_config(a.config)
     zc = cfg['zeus']
     # Same populations, same role mappings, complement query.
@@ -517,7 +507,7 @@ def main():
     zc['baseline_entities'] = GAP_BASELINE_ENTITIES
     if a.zeus:
         zc['path'] = a.zeus
-    z = M.load_zeus(zc, None if a.zeus else a.out)
+    z = M.load_zeus(zc, prefix)
 
     z['Z_Names_U'] = [usable_names(v) for v in z.Z_Names]
     z['Z_Cities_N'] = [[M._clean(x) for x in v if M._clean(x)] for v in z.Z_Cities]
@@ -528,6 +518,13 @@ def main():
         z = z.head(a.limit).copy()
         print(f'  --limit: {len(z):,} entities')
     z = z.reset_index(drop=True)
+
+    print('\nDefinitive tables:')
+    if a.definitive_from:
+        M.materialise_tables(cfg, M.resolve_prefix(a.definitive_from),
+                             replay=True, copy_to=prefix)
+    else:
+        M.materialise_tables(cfg, prefix)
 
     print('\nDefinitive location sources:')
     L = M.load_locations(cfg.get('locations'))
@@ -590,8 +587,20 @@ def main():
               'Zip_Score', 'StreetNum_Score', 'StreetName_Score',
               'Match_Score', 'Address_Match_Source', 'Location_Count',
               'StageA_Score', 'Matched_Zeus_Name', 'Matched_Definitive_Name',
-              'Matched_Via', 'Matched_Core_Tokens']:
+              'Matched_Via', 'Matched_Core_Tokens'] + M.MATCHED_ADDR_COLS:
         out[c] = best[c].reindex(idx).values
+    # Where Definitive says the proposed record is headquartered, beside the
+    # Matched_Definitive_* line that actually scored (often a satellite).
+    hq = d.drop_duplicates('DHC_Id').set_index('DHC_Id')
+    sid = pd.to_numeric(out.Suggested_DHC_Id, errors='coerce').astype('Int64')
+    for c, src in [('Suggested_Address', 'DHC_Addr1'),
+                   ('Suggested_City', 'DHC_City'),
+                   ('Suggested_State', 'DHC_State'),
+                   ('Suggested_Zip', 'DHC_Zip')]:
+        out[c] = sid.map(hq[src]).values
+    out['Matched_Zeus_Source'] = [
+        m.get(n, '') if isinstance(n, str) else ''
+        for m, n in zip(out.Z_Name_Sources, out.Matched_Zeus_Name)]
     out['Match_Margin'] = np.round(
         pd.to_numeric(margin.reindex(idx), errors='coerce').values, 1)
 
@@ -654,6 +663,31 @@ def main():
               f'client/work-location pair (see CLAUDE.md), but review before '
               f'loading.')
 
+    # Phone: a third signal, independent of the name and address evidence the
+    # tier rests on. Reported beside Match_Tier and never folded into it -
+    # decision #11 defines the tiers; promoting or demoting on phone is a
+    # separate decision, to be taken once these columns have been reviewed.
+    by_id, owners, shared = M.phone_index(d, L)
+    out = M.add_phone_columns(out, 'Suggested_DHC_Id', d, by_id, owners,
+                              shared)
+    for r in (1, 2):
+        out[f'Alt{r}_Phone_Match'] = pd.array(
+            [M.phone_match(zp, i, by_id, shared)[0]
+             for zp, i in zip(out.Z_Phones, out[f'Alt{r}_DHC_Id'])],
+            dtype='boolean')
+    # Exactly one of the three candidates shares the entity's number and it is
+    # a runner-up: phone disagrees with the pick in favour of a named rival.
+    trio = pd.DataFrame({k: out[k].fillna(False).astype(bool) for k in
+                         ['Phone_Match', 'Alt1_Phone_Match', 'Alt2_Phone_Match']})
+    out['Phone_Favours_Alt'] = (trio.sum(axis=1).eq(1)
+                                & ~trio.Phone_Match).values
+    out['Suggested_Phone'] = pd.to_numeric(out.Suggested_DHC_Id, errors='coerce') \
+        .astype('Int64').map(d.drop_duplicates('DHC_Id').set_index('DHC_Id')
+                             .DHC_Phone if 'DHC_Phone' in d else {})
+    print(f'\nPhones: {int(out.Z_Phones.map(len).gt(0).sum()):,} of {len(out):,} '
+          f'entities carry a usable Zeus phone; {len(shared):,} Definitive numbers '
+          f'shared by {M.PHONE_SHARED_MIN}+ ids ignored')
+
     # ---- report ----
     n = len(out)
     print(f'\n--- Coverage: {n:,} Zeus entities carrying no Definitive id ---')
@@ -680,6 +714,20 @@ def main():
         k = int((m & out.Match_Tier.eq('Strong match - ready to load')).sum())
         print(f'  {l:16}{int(m.sum()):>10,}{k:>9,}{k/max(int(m.sum()),1):>8.1%}')
 
+    print('\n--- Phone check on the pick (independent of the tier) ---')
+    print(f'  {"tier":34}{"confirms":>10}{"no match":>10}{"favours alt":>13}'
+          f'{"no phone":>10}')
+    for t in TIERS[:4]:
+        m = out[out.Match_Tier == t]
+        print(f'  {t:34}{int(m.Phone_Match.eq(True).sum()):>10,}'
+              f'{int(m.Phone_Match.eq(False).sum()):>10,}'
+              f'{int(m.Phone_Favours_Alt.sum()):>13,}'
+              f'{int(m.Phone_Match.isna().sum()):>10,}')
+    nm_ = out[out.Match_Tier == 'No credible match']
+    print(f'  No credible match, but the phone belongs to exactly one Definitive '
+          f'record: {int(nm_.Phone_Lookup_DHC_Id.notna().sum()):,} '
+          f'(Phone_Lookup_DHC_Id)')
+
     strong = out[out.Match_Tier == 'Strong match - ready to load']
     if len(strong):
         print('\n--- Strong tier: which Definitive string matched ---')
@@ -694,13 +742,13 @@ def main():
           [c for c in o.columns if c not in LEAD]]
     hit = o[o.Match_Tier != 'No credible match']
     miss = o[o.Match_Tier == 'No credible match']
-    hit.to_csv(f'{a.out}_gap_candidates.csv', index=False)
-    print(f'\nWrote {a.out}_gap_candidates.csv  ({len(hit):,} rows)')
+    hit.to_csv(f'{prefix}_gap_candidates.csv', index=False)
+    print(f'\nWrote {prefix}_gap_candidates.csv  ({len(hit):,} rows)')
     if len(miss):
         keep = [c for c in LEAD if c in miss.columns and
                 not c.startswith(('Suggested', 'Alt'))]
-        miss[keep].to_csv(f'{a.out}_gap_nomatch.csv', index=False)
-        print(f'Wrote {a.out}_gap_nomatch.csv  ({len(miss):,} rows)')
+        miss[keep].to_csv(f'{prefix}_gap_nomatch.csv', index=False)
+        print(f'Wrote {prefix}_gap_nomatch.csv  ({len(miss):,} rows)')
     print(f'\nTotal elapsed: {(time.time() - t_start) / 60:.1f} min')
     return o
 

@@ -102,6 +102,11 @@ zeus:
   # (one row per population per entity) and is pooled the same way on load.
   # path: audit_2026_08_zeus_extract.csv
 
+  # Phone numbers for all six populations, one query. Its Zeus_Source labels
+  # must equal the `label:` values above. Phones are a third signal beside name
+  # and address (Phone_Match); they never change Verdict or Match_Tier.
+  phone_query_file: Zeus entity phones.sql
+
   key: EntityId                     # one scored row per EntityId after pooling
   # Tried in order; the first non-null wins. Where both are populated and
   # disagree the row is flagged in DHC_Id_Conflict. Both live on dbo.Entity /
@@ -115,37 +120,61 @@ zeus:
 #
 # Definitive ids share a single namespace across entity types, so stacking
 # these widens the testable population without collisions - verified, the three
-# sets below share no ids at all. All four exports were re-cut on 2026-07-31 to
-# a common `DefinitiveId` key; the older HospitalId / HOSPITAL_ID column names
-# are gone.
+# sets below share no ids at all.
+#
+# A block names ONE of:
+#   path:        a local export (xlsx / csv)
+#   query_file:  a Databricks SQL file, run as written; needs `snapshot:`
+#   table:       a Unity Catalog table or view - shorthand for a SELECT of the
+#                role columns
+# The last two read through the `databricks:` connection. Databricks is live,
+# so each run writes a <run>_dhc_<snapshot>.parquet snapshot (plus the SQL that
+# produced it, as .sql) and scores that; keep both with the run outputs, like
+# the Zeus extract. A query's output columns must match the roles below. Column
+# names are the
+# table's own: the xlsx exports were re-cut on 2026-07-31 to a common
+# `DefinitiveId` key, but the Databricks tables keep their original names
+# (hospitaloverview: HospitalId, HospitalName).
 # ---------------------------------------------------------------------------
+databricks:
+  host: https://adb-8032826808193104.4.azuredatabricks.net
+  # OAuth login held by the CLI: `databricks auth login --profile jcl`.
+  profile: jcl
+  warehouse_id: 5941bfd954019dc3    # qat-eus-jcl-Databricks-W-M
+
 definitive:
-  - path: Definitive_HospitalOverview.xlsx
+  - query_file: Definitive Hospital Overview.sql
+    snapshot: hospitaloverview        # <run>_dhc_hospitaloverview.parquet
     entity_type: Hospital
-    id: DefinitiveId
-    name: Name
+    id: HospitalId
+    name: HospitalName
     address: [AddressHq, Address1Hq]
     city: HqCity
     state: HqState
     zip: HqZipCode
+    phone: PhoneHq
 
-  - path: Definitive_PhysicianGroupOverview.xlsx
+  - query_file: Definitive Physician Group Overview.sql
+    snapshot: physiciangroupsoverview
     entity_type: PhysicianGroup
-    id: DefinitiveId
-    name: Definitive_NAME
-    address: [HQ_ADDRESS, HQ_ADDRESS1]
-    city: HQ_CITY
-    state: HQ_STATE
-    zip: HQ_ZIP_CODE
-
-  - path: Definitive_GPO_Overview.xlsx
-    entity_type: GPO
-    id: DefinitiveId
-    name: Name
+    id: HospitalId                    # the practice's own id, not a parent
+    name: HospitalName
     address: [HeadquartersAddress, HeadquartersAddress1]
     city: HeadquartersCity
     state: HeadquartersState
     zip: HeadquartersZipCode
+    phone: HeadquartersPhone
+
+  - query_file: Definitive GPO Overview.sql
+    snapshot: gpooverview
+    entity_type: GPO
+    id: HospitalId
+    name: HospitalName
+    address: [HeadquartersAddress, HeadquartersAddress1]
+    city: HeadquartersCity
+    state: HeadquartersState
+    zip: HeadquartersZipCode
+    phone: HeadquartersPhone
 
 # ---------------------------------------------------------------------------
 # LOCATION sources: MANY rows per Definitive id - one per service location.
@@ -164,10 +193,14 @@ definitive:
 # location row as identity, tagged entity_type PracticeLocation.
 # ---------------------------------------------------------------------------
 locations:
-  - path: Definitive_Practice_Locations.xlsx
-    id: DefinitiveId
-    name: Name
+  # The view is one row per physician per location; the query's DISTINCT and
+  # IS NOT NULL are what make it one row per location of a known parent.
+  - query_file: Definitive Practice Locations.sql
+    snapshot: practicelocations
+    id: PracticeLocationHospitalId    # the PARENT entity's id
+    name: Location
     address: [HeadquartersAddress, HeadquartersAddress1]
     city: HeadquartersCity
     state: HeadquartersState
     zip: HeadquartersZipCode
+    phone: Phones                     # '|'-joined, see the query
