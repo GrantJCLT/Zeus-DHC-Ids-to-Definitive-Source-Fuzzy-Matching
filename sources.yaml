@@ -204,3 +204,17 @@ locations:
     state: HeadquartersState
     zip: HeadquartersZipCode
     phone: Phones                     # '|'-joined, see the query
+
+# ---------------------------------------------------------------------------
+# HIERARCHY source: read by dhc_hierarchy.py only, never by the two audits.
+#
+# Hospital Overview only, by rule (2026-09-30). The parent rule -
+# SfParentAccountId, else IdNetwork, else HospitalId (a root) - lives in the
+# query, which emits ParentId and Parent_Rule. Snapshotted per run like the
+# blocks above.
+# ---------------------------------------------------------------------------
+hierarchy:
+  query_file: Definitive Hospital Hierarchy.sql
+  snapshot: hospitalhierarchy         # <run>_dhc_hospitalhierarchy.parquet
+  id: HospitalId
+  name: HospitalName

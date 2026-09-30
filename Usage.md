@@ -11,6 +11,7 @@ do, see [CLAUDE.md](CLAUDE.md).
 |---|---|---|---|
 | **Accuracy**: of the Zeus entities that carry a DHC ID, how many point at the right Definitive record? | `dhc_match_v2.py run` | `Zeus_DHC_ID_Accuracy_Audit_<date>_<time>.xlsx` | 2–3 min |
 | **Coverage**: which Zeus entities carry no DHC ID, and which Definitive record should each one point at? | `dhc_gap_match.py` | `Zeus_DHC_ID_Coverage_Audit_<date>_<time>.xlsx` | 20–30 min |
+| **Hierarchy**: how Definitive's hospitals and health systems nest under their owners, for comparison with the migration team's destination data | `dhc_hierarchy.py` | `Definitive_Hospital_Hierarchy_<date>_<time>.xlsx` plus `<run>_hierarchy.csv` | under 1 min |
 | **Optional extra:** the same answers limited to one Zeus population, e.g. Work Locations for the third-party data-cleaning group. **An extra workbook alongside the full one, never instead of it** | the same runs, plus a build with `--population WorkLocation` | `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<date>_<time>.xlsx` and `..._Coverage_Audit_WorkLocation_...` | seconds, once the runs exist |
 
 Each question takes two steps: a **run**, which reads Zeus and Definitive and
@@ -493,6 +494,61 @@ own satellite while the HQ is elsewhere. Compare the matched pair, not the HQ.
 Treat `True` as strong supporting evidence and `False` as a reason to look
 closer. On confirmed accuracy rows the phones agree about 92% of the time, so
 some disagreement is normal: numbers change.
+
+## 3. Hospital ownership hierarchy
+
+One command. It reads Definitive Hospital Overview only (hospitals and health
+systems), gives every record one parent, and walks each chain up to its root:
+
+```
+py dhc_hierarchy.py --config sources.yaml     --accuracy "Results Output/<accuracy run>/<accuracy run>_scored.csv"
+```
+
+The parent rule is `SfParentAccountId`, else `IdNetwork`, else the record's own
+`HospitalId`, which makes it a root. The rule is written in
+`Definitive Hospital Hierarchy.sql` and nowhere else, and the `Parent_Rule`
+column says which step decided each row. `--accuracy` is optional: it adds the
+Zeus EntityIds that carry each Definitive id (`Zeus_EntityIds`,
+`Tree_Zeus_Entity_Count`), so the destination data can be compared on either
+key. `--definitive-from <hierarchy run folder>` replays that run's snapshot,
+and the output is byte-identical.
+
+Every record gets **two parents, labelled**, because the tree runs up to three
+levels deep (system > division or region > hospital), and the destination
+system may model either grain:
+
+| Prefix | Meaning | Example for Medical City Denton |
+|---|---|---|
+| `Immediate_Parent*` | The direct owner, in the full tree. `Immediate_Level` is 0 for a root and up to 2 below it | HCA Medical City Healthcare (North Texas Division) |
+| `Ultimate_Parent*` | The top-level owner, with the tree flattened to two levels. `Ultimate_Level` is 0 or 1 | HCA Healthcare |
+
+They differ only for the 2,247 records with `Has_Intermediate_Parent = True`.
+A root is its own immediate and ultimate parent.
+
+Written to `Results Output/dhc_hierarchy_<date>_<time>/`:
+
+- `<run>_hierarchy_immediate.csv`: one edge per record, record → direct
+  owner. The full tree.
+- `<run>_hierarchy_ultimate.csv`: one edge per record, record → top-level
+  owner. The flattened tree, with the skipped division named in
+  `Intermediate_ParentId` / `Intermediate_ParentName`.
+- `<run>_hierarchy.csv`: everything on one row per record, sorted by tree:
+  both parents, `Path_Ids` / `Path_Names` (root first, `" > "`-separated),
+  `Immediate_Child_Count`, `Descendant_Count`, `Hierarchy_Issue`, and the Zeus
+  columns. Hand the migration team the edge list that matches their grain, or
+  this file if they want both.
+- `<run>_dhc_hospitalhierarchy.parquet` / `.sql`: the snapshot and the SQL
+  that produced it.
+- `Definitive_Hospital_Hierarchy_<date>_<time>.xlsx`: Summary (records by
+  level, immediate versus ultimate, by rule, largest ultimate parents,
+  identity checks), Methodology, Immediate_Parent, Ultimate_Parent,
+  Hierarchy, Roots, Hierarchy_Issues, and Zeus_Linked if `--accuracy` was
+  given.
+
+What you should see (2026-09-30): 9,887 records, 2,589 trees (683 with more
+than one member), maximum depth 2, two `Parent_Not_In_Definitive` rows, and
+four `OK` checks. A `FAIL` or a jump in the issue count means the view changed
+shape. Look before you circulate.
 
 ---
 

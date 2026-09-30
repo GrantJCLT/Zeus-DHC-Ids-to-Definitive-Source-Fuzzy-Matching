@@ -26,11 +26,13 @@ Results Output/
 *_zeus_extract.csv
 *_gap_candidates.csv
 *_gap_nomatch.csv
+*_hierarchy.csv
 
 # Generated deliverables. Both carry Zeus client names and addresses, so match
 # the family rather than one audit's name — the Coverage workbook was written
 # straight past the Accuracy-only rule on 2026-08-19.
 Zeus_DHC_ID_*.xlsx
+Definitive_Hospital_Hierarchy*.xlsx
 
 # Secrets, in case one ever lands here
 .env

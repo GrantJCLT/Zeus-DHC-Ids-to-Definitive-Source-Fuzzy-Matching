@@ -63,6 +63,33 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   READ_ONLY, NOTE, WARNING and identity-check lines, exit code 1 if any
   failed. `py run_all.py --limit 200 --label smoke` is a 4-minute end-to-end
   test.
+- `dhc_hierarchy.py` — the Definitive hospital ownership hierarchy, added
+  2026-09-30 for comparison with the migration team's destination data. It
+  reads **Hospital Overview only**, by rule, via `Definitive Hospital
+  Hierarchy.sql` (the `hierarchy:` block in `sources.yaml`). Parent =
+  `SfParentAccountId`, else `IdNetwork`, else the record's own `HospitalId`
+  (a root). The rule lives in the SQL only, and the script just walks it.
+  Every record gets **both** an `Immediate_Parent*` (direct owner, full tree,
+  depth ≤ 2) and an `Ultimate_Parent*` (top-level owner, flattened), labelled.
+  Both are kept by Grant's decision on 2026-09-30, because the destination
+  system may model divisions (HCA North Texas, VISN 1) as their own accounts
+  or not. They differ for 2,247 records (`Has_Intermediate_Parent`). Writes
+  `<run>_hierarchy_immediate.csv` and `_ultimate.csv` (one edge list per
+  grain), `<run>_hierarchy.csv` (both on one row, with path and counts) and a
+  branded workbook, and snapshots the view like the audits.
+  `--accuracy <scored.csv>` attaches the Zeus EntityIds per id. The
+  comparison against the migration team's data is not built yet, because
+  their data's shape is unknown. Measured 2026-09-30: 9,887 records, 2,589
+  trees, 683 of them with more than one member, no cycles, 2 parents absent
+  from the view (kept, flagged `Parent_Not_In_Definitive`). Every parent is a
+  health system; no hospital sits under a hospital.
+  **How the rule really behaves:** on every hospital, `SfParentAccountId`
+  equals `IdNetwork` (6,937) or both are empty (1,772, standalone). On every
+  health system, `IdNetwork` is the record's own id, and `SfParentAccountId`
+  is the larger system above it (363). So step 2 never yields a parent that
+  steps 1 and 3 would not. It is kept as specified in case Definitive ever
+  populates `IdNetwork` without `SfParentAccountId`. Physician groups, GPOs
+  and practice locations are out of scope "at this time".
 - `Zeus_DHC_ID_Audit_Business_Overview.md` — plain-language overview of the
   project for business readers, written 2026-09-28 from the 2026-08-12 and
   2026-08-19 runs. Its figures are hand-copied, so update it after a new run.
@@ -442,9 +469,9 @@ The folder is a git repo with a **private** GitHub remote,
 `GrantJCLT/Zeus-DHC-Ids-to-Definitive-Source-Fuzzy-Matching`. Keep it private:
 the history contains licensed Definitive exports and Zeus client records.
 
-Only source is tracked — the four scripts plus `run_all.py`, `sources.yaml`,
-the seventeen `.sql` files (twelve Zeus population queries, the Zeus phone
-query, four Definitive), this file, `Usage.md`, `Environment.md`,
+Only source is tracked — the four scripts plus `run_all.py` and `dhc_hierarchy.py`, `sources.yaml`,
+the eighteen `.sql` files (twelve Zeus population queries, the Zeus phone
+query, four Definitive sources, the hospital hierarchy), this file, `Usage.md`, `Environment.md`,
 the business overview, and `.gitignore`. Everything else is deliberately ignored:
 
 | Ignored | Why |
