@@ -193,9 +193,14 @@ def build_summary(wb, s, funnel, verdicts, by_type, by_pop, gains, subtitle,
          f'{overall["untestable"]:,} ({overall["untestable"] / zeus:.1%}) cannot '
          f'be judged either way: their identifier is not present in any '
          f'Definitive export supplied, which makes them unverifiable rather '
-         f'than wrong. Of the {total:,} that CAN be tested, {corr / total:.1%} '
-         f'are confirmed and {funnel["corr_or_prob"] / total:.1%} are confirmed '
-         f'or probable.',
+         f'than wrong. ' + (
+             f'Of the {total:,} that CAN be tested, {corr / total:.1%} are '
+             f'confirmed and {funnel["corr_or_prob"] / total:.1%} are confirmed '
+             f'or probable.' if total else
+             # A small --population (VMS has one entity, untestable) can have
+             # no testable row; say so rather than divide by it.
+             'None of them can be tested, so no accuracy rate can be given '
+             'for this population.'),
          BODY, FILL_CREAM, align=WRAP)
 
     r = 9

@@ -53,6 +53,16 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   workbooks cannot drift apart; edit the styling in one place only.
   `py build_coverage_workbook.py --candidates <run>_gap_candidates.csv
   [--accuracy <audit>_scored.csv] [--out <name>.xlsx]`
+- `run_all.py` — runs everything in order, added 2026-09-30: accuracy run,
+  coverage run, both workbooks, and scoped workbooks for each `--population`.
+  Calls the four scripts unchanged as subprocesses with its own
+  `sys.executable`, chaining them by the `Run folder  :` line each run prints.
+  The coverage run gets `--claimed` and **`--definitive-from` the accuracy
+  run**, so both audits score against one Definitive state (the views refresh
+  in place). Stops at the first failing step; ends with a summary of the
+  READ_ONLY, NOTE, WARNING and identity-check lines, exit code 1 if any
+  failed. `py run_all.py --limit 200 --label smoke` is a 4-minute end-to-end
+  test.
 - `Zeus_DHC_ID_Audit_Business_Overview.md` — plain-language overview of the
   project for business readers, written 2026-09-28 from the 2026-08-12 and
   2026-08-19 runs. Its figures are hand-copied, so update it after a new run.
@@ -284,6 +294,14 @@ py build_coverage_workbook.py --candidates ".../<run>_gap_candidates.csv" \
     --accuracy ".../<accuracy run>_scored.csv" --population WorkLocation
 ```
 
+**`--population` is additive, never a carve-out:** the runs always score all six
+populations and the full workbooks are always built; a scoped workbook is an
+*extra* view of the same results (`run_all.py --population X` writes four
+workbooks, not two). Usage.md's "`--population` labels" table lists all six
+labels with their counts; `VMS` has no testable ID-carrying entity, so its
+accuracy Summary states that instead of a rate (a divide-by-zero before
+2026-09-30).
+
 It filters the run's **outputs, never the scoring**. A Work Location entity that
 is also a Client is still matched on every name and address it holds in any
 population (decision #10) — do not get the same effect by filtering the query
@@ -424,8 +442,9 @@ The folder is a git repo with a **private** GitHub remote,
 `GrantJCLT/Zeus-DHC-Ids-to-Definitive-Source-Fuzzy-Matching`. Keep it private:
 the history contains licensed Definitive exports and Zeus client records.
 
-Only source is tracked — the four scripts, `sources.yaml`, the sixteen `.sql`
-files (twelve Zeus, four Definitive), this file, `Usage.md`, `Environment.md`,
+Only source is tracked — the four scripts plus `run_all.py`, `sources.yaml`,
+the seventeen `.sql` files (twelve Zeus population queries, the Zeus phone
+query, four Definitive), this file, `Usage.md`, `Environment.md`,
 the business overview, and `.gitignore`. Everything else is deliberately ignored:
 
 | Ignored | Why |

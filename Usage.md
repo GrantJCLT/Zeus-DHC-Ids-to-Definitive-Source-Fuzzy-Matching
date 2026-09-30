@@ -11,6 +11,7 @@ do, see [CLAUDE.md](CLAUDE.md).
 |---|---|---|---|
 | **Accuracy**: of the Zeus entities that carry a DHC ID, how many point at the right Definitive record? | `dhc_match_v2.py run` | `Zeus_DHC_ID_Accuracy_Audit_<date>_<time>.xlsx` | 2–3 min |
 | **Coverage**: which Zeus entities carry no DHC ID, and which Definitive record should each one point at? | `dhc_gap_match.py` | `Zeus_DHC_ID_Coverage_Audit_<date>_<time>.xlsx` | 20–30 min |
+| **Optional extra:** the same answers limited to one Zeus population, e.g. Work Locations for the third-party data-cleaning group. **An extra workbook alongside the full one, never instead of it** | the same runs, plus a build with `--population WorkLocation` | `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<date>_<time>.xlsx` and `..._Coverage_Audit_WorkLocation_...` | seconds, once the runs exist |
 
 Each question takes two steps: a **run**, which reads Zeus and Definitive and
 writes CSV results, and a **build**, which turns those CSVs into the branded
@@ -38,6 +39,122 @@ py -c "import rapidfuzz, pyodbc, openpyxl, yaml, databricks.sql; print('ok')"
 
 If that fails with `ModuleNotFoundError`, VS Code has probably activated the
 incomplete project `.venv`. See "Which Python" in [Environment.md](Environment.md).
+
+## Run everything at once
+
+```powershell
+py run_all.py
+```
+
+That one command is the full refresh: **both audits, over all six Zeus
+populations, and both full workbooks**. About 30 minutes. It runs:
+
+1. the accuracy run;
+2. the coverage run, cross-checked against step 1 (`--claimed`) and scored
+   against **step 1's Definitive snapshots** (`--definitive-from`), so both
+   audits see exactly the same Definitive data even though the views refresh in
+   place;
+3. the full accuracy workbook and the full coverage workbook.
+
+### Add the Work Location workbooks as well
+
+```powershell
+py run_all.py --population WorkLocation
+```
+
+This does **everything the plain command does, and then builds two more
+workbooks** limited to Work Location entities, for the third-party
+data-cleaning group.
+
+> **`--population` adds workbooks. It never narrows the run.** Both audits
+> still read and score every entity in all six populations, and the two full
+> workbooks are still built. The Work Location workbooks are an extra view of
+> the same results, filtered after scoring. Nothing is left out of anything.
+
+What each form writes:
+
+| Command | Workbooks written |
+|---|---|
+| `py run_all.py` | 2: `Zeus_DHC_ID_Accuracy_Audit_<run>.xlsx`, `Zeus_DHC_ID_Coverage_Audit_<run>.xlsx`, covering all populations |
+| `py run_all.py --population WorkLocation` | 4: the same 2, **plus** `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<run>.xlsx` and `Zeus_DHC_ID_Coverage_Audit_WorkLocation_<run>.xlsx` |
+| `py run_all.py --population WorkLocation --population Client` | 6: the same 2, plus 2 for Work Location, plus 2 for Client |
+
+The run time is the same either way; each extra pair of workbooks takes under a
+minute. For the labels you can use and what each contains, see
+[`--population` labels](#--population-labels) below.
+
+### What you see
+
+Each step is the ordinary script described below, run with the same Python as
+`run_all.py`, so the console shows its normal output. The first step that
+fails stops everything. The end is a summary:
+
+```
+Summary  (2x.x min)
+    1.6 min  1. Accuracy run
+   2x.x min  2. Coverage run
+   ...
+Checks:
+  OK   1. Accuracy run: connected to a READ_ONLY database
+  OK   2. Coverage run: connected to a READ_ONLY database
+  NOTE 2. Coverage run: NOTE: +118 vs the expected 48,739 entities ...
+  OK   4. Coverage workbook: tier counts sum to population    48,857 == 48,857  OK
+  ...
+Workbooks:
+  Results Output\dhc_match_v2_...\Zeus_DHC_ID_Accuracy_Audit_....xlsx
+  ...
+All steps finished and every check passed.
+```
+
+A `NOTE` line is repeated for you to judge (see check 2 below); anything marked
+`FAIL` or `WARN` is listed again under "Needs attention before circulating", and
+the command exits with code 1.
+
+| Option | Effect |
+|---|---|
+| `--population <label>` | **Adds** workbooks limited to that population, beside the full ones; repeatable. Never changes what is run or scored. See [`--population` labels](#--population-labels) |
+| `--label <x>` | Suffix for both run folders |
+| `--accuracy-only` | Just the accuracy run and its workbook(s), about 3 minutes |
+| `--limit N` | Coverage scores only the first N entities: a 4-minute end-to-end test. The "extract entities = population" check shows `n/a` then, as expected |
+| `--no-reverse` | Accuracy run skips the reverse lookup |
+| `--config <file>` | Default `sources.yaml` |
+
+`py run_all.py --limit 200 --label smoke` is the quick way to confirm every
+connection and step works before a full run. Delete its folders afterwards.
+
+### `--population` labels
+
+The label is a population name from `zeus.sources` in `sources.yaml`. There are
+six. Case and spaces are ignored (`workLocation` and `"work location"` both
+work); an unknown label stops the build and lists the valid ones.
+
+| Label | Which Zeus entities | Carry a DHC ID (testable) | Of those, in this population only | Carry no ID (strong match) | Of those, in this population only |
+|---|---|---|---|---|---|
+| `Client` | `IsClient = 1`, names and addresses from `ClientInfo` | 9,171 (7,665) | 2,389 | 24,139 (5,631) | 18,684 |
+| `WorkLocation` | `IsWorkLocation = 1`, from `WorkLocationInfo` | 10,047 (9,228) | 3,405 | 29,599 (5,395) | 24,243 |
+| `HealthSystem` | `IsHealthSystem = 1`, from `HealthSystemInfo` | 599 (578) | 154 | 531 (117) | 407 |
+| `GPO` | `IsGPO = 1`, from `GPOInfo` | 1 (1) | 0 | 13 (5) | 4 |
+| `Agency` | `IsAgency = 1`, from `AgencyInfo` | 1 (1) | 0 | 52 (0) | 45 |
+| `VMS` | `IsVMS = 1`, from `VMSInfo` | 1 (0) | 0 | 27 (1) | 12 |
+
+Figures from the 2026-09-29 live runs; Zeus is live, so expect drift. Reading
+the table:
+
+- **Populations overlap.** An entity flagged both `IsClient` and
+  `IsWorkLocation` is one entity, scored once, and it appears in **both** the
+  `Client` and the `WorkLocation` workbooks. About 6,000 of the ID-carrying
+  entities are in both. So the rows add up to more than the real totals, which
+  are 12,803 with an ID and 48,857 without.
+- **"In this population only"** counts entities with no other flag. The rest
+  are shared. `Matched_Zeus_Source` on each row says whether its result rests
+  on this population's name or on another one's.
+- **`GPO`, `Agency` and `VMS` are tiny.** Their workbooks build, but they're
+  nearly empty. `VMS` has no testable ID-carrying entity, and its accuracy
+  Summary says so rather than giving a rate.
+- **`--population` is repeatable** on `run_all.py`: each label gives its own
+  pair of workbooks. The single-workbook builders below take one label per run.
+
+The sections below run the same steps one at a time.
 
 ## Before every run
 
@@ -71,26 +188,36 @@ Use both `--zeus` and `--definitive-from` to rerun a past result fully offline.
 **Expected console output**, in order. The comments call out what to check.
 
 ```
-Run folder  : Results Output/dhc_match_v2_2026_09_29_1422
-Databricks  : https://adb-8032826808193104.4.azuredatabricks.net (warehouse 5941bfd954019dc3)
-  Definitive Hospital Overview.sql: 9,887 rows -> hospitaloverview
-  ... one line per Definitive query (4 in total)
+Run folder  : Results Output\dhc_match_v2_2026_09_29_1647
 Zeus source : Zeus on prd-jcl-zeus-failover....database.windows.net
   intent    : ReadOnly
   connected to a READ_ONLY database        <-- CHECK 1: must say READ_ONLY
-  Client          x,xxx rows ...
-  WorkLocation    x,xxx rows ...           <-- CHECK 3: six populations, none zero
+  Client           9,1xx rows ...
+  WorkLocation    10,0xx rows ...          <-- CHECK 3: six populations, none zero
   ...
+  phones         356,xxx rows  (Zeus entity phones.sql)
   extract snapshot -> ..._zeus_extract.csv
 Zeus rows   : 19,8xx population rows -> 12,8xx distinct entities
   NOTE: +N vs the expected 12,803 ...      <-- CHECK 2: absent, or small and explainable
+
+Definitive tables:
+Databricks  : https://adb-8032826808193104.4.azuredatabricks.net (warehouse 5941bfd954019dc3)
+  Definitive Hospital Overview.sql: 9,887 rows -> ..._dhc_hospitaloverview.parquet
+  ... one line per Definitive query (4 in total)
 ...
+Phones      : 12,4xx of 12,8xx entities carry a usable Zeus phone; ... 3,0xx shared by 5+ ids ignored
 ID testable  : 11,0xx  (86.x% of Zeus)
 
 --- Verdicts (testable population) ---
   ID corroborated                          10,7xx   96.x%
   ...
   CORROBORATED + PROBABLE                  ...      98.x%
+
+--- Phone (independent of Verdict) ---
+  phone on both sides                      10,0xx
+    numbers agree                           9,2xx   91.x%
+    number belongs to another record          1xx  <-- review (Phone_Points_Elsewhere sheet)
+  Needs review      phone agrees   56 / points elsewhere  7 of 117
 
 --- By Definitive entity type ---
 --- By Zeus population (overlapping; entities counted in each) ---
@@ -118,9 +245,9 @@ prefixed with the folder name:
 
 | File | Contents |
 |---|---|
-| `<run>_scored.csv` | One row per testable Zeus entity: verdict, scores, matched Definitive name, flags |
-| `<run>_unverifiable.csv` | Entities whose ID is in no Definitive source |
-| `<run>_zeus_extract.csv` | The exact Zeus input that was scored, for replay |
+| `<run>_scored.csv` | One row per testable Zeus entity: verdict, scores, the matched name and address pair, the Definitive HQ, phone check, flags |
+| `<run>_unverifiable.csv` | Entities whose ID is in no Definitive source. `Phone_Lookup_DHC_Id` / `_Name` is the one Definitive record holding the entity's phone, where there is exactly one: the only lead these rows have |
+| `<run>_zeus_extract.csv` | The exact Zeus input that was scored, including each entity's phones (`Z_Phones`), for replay |
 | `<run>_dhc_<table>.parquet` | Snapshot of each Definitive source as queried |
 | `<run>_dhc_<table>.sql` | The exact SQL that produced each snapshot |
 
@@ -146,11 +273,16 @@ Wrote Results Output/<run>/Zeus_DHC_ID_Accuracy_Audit_2026_09_29_1422.xlsx
   Geo_Conflict                    ...
   Address_Divergence              ...
   Corrections_Recommended         ...
+  Phone_Points_Elsewhere          ...
   Duplicate_IDs                   ...
   ID_Conflicts                    ...
   Scored_Detail                   ...
   Unreferenced_Definitive         ...
 ```
+
+`Phone_Points_Elsewhere` lists supplied IDs whose phone number belongs to
+exactly one *other* Definitive record. It's the phone check's review queue; the
+verdict itself is unchanged.
 
 The builder reads the run's own Definitive snapshots, and it **stops** if they
 are missing rather than query live data. Runs from before 2026-09-29 have no
@@ -158,6 +290,37 @@ snapshots; build those with a config that points at the old xlsx exports.
 
 **CHECK 4:** on the `Summary` sheet, testable + unverifiable should equal
 supplied, and the verdict counts should sum to testable.
+
+### An extra workbook for one population (`--population`)
+
+After building the full workbook above, you can **also** build one limited to a
+single Zeus population, for example the Work Location subset the third-party
+data-cleaning group is working. Run the builder a second time with
+`--population`:
+
+```powershell
+py build_audit_workbook.py --scored "Results Output\<run>\<run>_scored.csv" `
+    --population WorkLocation
+```
+
+- **This adds a workbook; it replaces and narrows nothing.** The run already
+  scored every population, and the full workbook stays as it is. Build it first
+  without `--population`, then again with it.
+- The label is one of the six in [`--population` labels](#--population-labels).
+  An unknown label stops with the list of valid ones.
+- It writes `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<date>_<time>.xlsx` beside
+  the full workbook, never over it.
+- Every sheet, headline and total covers only that population, and the Summary and
+  Methodology say so.
+- **It filters the results, not the matching.** Each entity was still matched on
+  every name and address it holds in any population.
+- **"Work Location" means any entity flagged as a Work Location, including
+  those that are also Clients** (about 6,000 of the 10,000 that carry an ID). To
+  see whether a result rests on the Work Location name or the Client one, read
+  `Matched_Zeus_Source`.
+- Don't get a subset by editing the Zeus queries instead. Filtering there removes
+  address evidence and drops entities from both audits; see CLAUDE.md,
+  "One population only".
 
 ---
 
@@ -196,6 +359,8 @@ Stage A - retrieving candidates for 48,7xx entities:
 Stage B - exact scoring:
     scored  x,xxx of 48,7xx ...
 
+Phones: 42,0xx of 48,8xx entities carry a usable Zeus phone; 3,0xx Definitive numbers shared by 5+ ids ignored
+
 --- Coverage: 48,7xx Zeus entities carrying no Definitive id ---
   tier                                entities    share
   Strong match                           9,6xx    19.x%
@@ -208,6 +373,11 @@ Stage B - exact scoring:
   needs a human                          ...
 
 --- By Zeus population (overlapping; entities counted in each) ---
+--- Phone check on the pick (independent of the tier) ---
+  tier                                confirms  no match  favours alt  no phone
+  Strong match - ready to load           6,7xx     1,9xx          1xx       9xx
+  ...                                                           <-- review "favours alt" rows
+  No credible match, but the phone belongs to exactly one Definitive record: 2,4xx
 --- Strong tier: which Definitive string matched ---
   Name                   7,8xx             <-- CHECK: mostly Name, not Location
   Alias                  ...
@@ -246,13 +416,14 @@ py build_coverage_workbook.py `
 versus unlinked entities, and what loading the strong tier would do to coverage.
 
 This writes `Zeus_DHC_ID_Coverage_Audit_<run date>_<time>.xlsx` into the gap run's
-folder, lists its twelve sheets, then re-checks three identities:
+folder, lists its fourteen sheets, then re-checks three identities:
 
 ```
-Wrote Results Output/<run>/Zeus_DHC_ID_Coverage_Audit_2026_09_29_1450.xlsx
+Wrote Results Output/<run>/Zeus_DHC_ID_Coverage_Audit_2026_09_29_1647.xlsx
   Summary / Methodology / Ready_To_Load / Review_Probable / Ambiguous_Rivals /
   Review_Weak / Parent_Id_Proposals / Shared_Id_Proposals /
-  Id_Already_Linked_In_Zeus / Status_Flagged / No_Credible_Match / Candidates_Detail
+  Id_Already_Linked_In_Zeus / Status_Flagged / Phone_Favours_Alt /
+  Phone_Only_Match / No_Credible_Match / Candidates_Detail
 
 Identity checks:
   tier counts sum to population    48,7xx == 48,7xx  OK
@@ -266,6 +437,62 @@ How to read it: `Ready_To_Load` is the actionable sheet. Before loading anything
 from it, understand `Parent_Id_Proposals`, `Shared_Id_Proposals`,
 `Id_Already_Linked_In_Zeus` and `Status_Flagged`. `No_Credible_Match` is the
 input to any "buy more Definitive data" discussion.
+
+The two phone sheets are review queues. The tiers themselves don't use phone:
+
+- `Phone_Favours_Alt`: the entity's phone matches one of the two runners-up,
+  not the pick. The rows in `Ready_To_Load` are the ones to check first.
+- `Phone_Only_Match`: no name match was credible, but the entity's phone
+  belongs to exactly one Definitive record (`Phone_Lookup_DHC_Id`). These are
+  leads for review, not proposals to load. A phone can be stale or a shared
+  office line.
+
+To **also** build a Work Location coverage workbook, run the builder a second
+time with `--population WorkLocation`, exactly as for the accuracy workbook. This
+adds a workbook beside the full one and changes nothing else (labels:
+[`--population` labels](#--population-labels)):
+
+```powershell
+py build_coverage_workbook.py `
+    --candidates "Results Output\<gap run>\<gap run>_gap_candidates.csv" `
+    --accuracy "Results Output\<accuracy run>\<accuracy run>_scored.csv" `
+    --population WorkLocation
+```
+
+The identity checks then run on the Work Location population. The estate
+section covers only Work Location entities, linked and unlinked.
+
+---
+
+## Reading the review sheets
+
+Every review sheet in both workbooks puts the two sides next to each other,
+left to right:
+
+| Column group | What it is |
+|---|---|
+| `Zeus_*` | What Zeus holds: every name, address and phone pooled across the entity's populations |
+| `DHC_*` (accuracy) / `Suggested_*` (coverage) | The Definitive record's **HQ**: name, address, city, state, zip, phone |
+| `Matched_Zeus_Name`, `Matched_Definitive_Name`, `Matched_Via`, `Matched_Zeus_Source` | The two names that actually produced `Name_Score`. `Matched_Via` says whether the Definitive side was the record's name, a former name (`Alias`) or a service location (`Location`). `Matched_Zeus_Source` says which Zeus population holds that name |
+| `Matched_Zeus_Address/City/State/Zip`, `Matched_Definitive_Address/City/State/Zip` | The two addresses that produced the street scores |
+| `Phone_Match`, `Matched_Phone`, `Phone_Lookup_*` | The phone check (below) |
+
+**The matched address isn't always the HQ.** Where `Address_Match_Source` is
+`Location`, the Zeus address matched one of the record's service locations, and
+`Matched_Definitive_*` shows that site. A Zeus clinic can score 100 against its
+own satellite while the HQ is elsewhere. Compare the matched pair, not the HQ.
+
+**The phone check never changes a verdict or tier.** `Phone_Match` is:
+
+- `True`: a Zeus number equals one of the record's numbers (HQ or any site);
+- `False`: both sides have usable numbers and none agree;
+- blank: one side has no usable number, or the only overlap is a number shared
+  by five or more Definitive records (a switchboard). Blank means no evidence
+  either way, not disagreement.
+
+Treat `True` as strong supporting evidence and `False` as a reason to look
+closer. On confirmed accuracy rows the phones agree about 92% of the time, so
+some disagreement is normal: numbers change.
 
 ---
 
@@ -302,6 +529,14 @@ py dhc_match_v2.py run --config sources.yaml `
 
 Verified: replaying an extract reproduces the run exactly.
 
+- The replay copies the earlier run's Definitive snapshots (and their `.sql`)
+  into its own folder, so its workbook can be built from that folder alone.
+- The same works for the coverage tool: `dhc_gap_match.py` takes `--zeus` and
+  `--definitive-from` too.
+- Extracts from before 2026-09-29 carry no phones. A replay of one prints
+  `note: this extract predates phone capture` and leaves the phone columns
+  blank; everything else is unaffected.
+
 ## After a run: what to keep
 
 The whole `Results Output\` folder is git-ignored. It holds Zeus client names
@@ -330,3 +565,5 @@ After a new run, update the hand-copied figures in
 | `... is missing [column]` naming a Zeus or Definitive column | A query or view renamed a column | Fix the `.sql` alias or the role mapping in `sources.yaml` |
 | Builder stops: snapshot missing | The run folder has no `_dhc_*.parquet` (pre-2026-09-29, or files moved) | Build with a config that points at the xlsx exports, or rerun |
 | `PermissionError` writing the `.xlsx` | The workbook is open in Excel | Close it and rebuild |
+| VS Code marks the `Definitive *.sql` files full of errors (`Invalid object name 'prd_silver...'`, `'array_sort' is not a recognized built-in function`) | The editor checks every `.sql` file as SQL Server. These four are Databricks SQL | False alarm. To check one, run it in the Databricks SQL editor |
+| `--population 'X' is not in this run; choose one of [...]` | The label isn't a `zeus.sources` label | Use one from the list, e.g. `WorkLocation` |
