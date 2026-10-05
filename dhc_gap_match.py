@@ -510,7 +510,7 @@ def main():
     z = M.load_zeus(zc, prefix)
 
     z['Z_Names_U'] = [usable_names(v) for v in z.Z_Names]
-    z['Z_Cities_N'] = [[M._clean(x) for x in v if M._clean(x)] for v in z.Z_Cities]
+    z['Z_Cities_N'] = [[M.norm_city(x) for x in v if M.norm_city(x)] for v in z.Z_Cities]
     z['Z_States_N'] = [sorted({M.norm_state(x) for x in v} - {''})
                        for v in z.Z_States]
     z['Z_Zips_N'] = [sorted({M.norm_zip5(x) for x in v} - {''}) for v in z.Z_Zips]

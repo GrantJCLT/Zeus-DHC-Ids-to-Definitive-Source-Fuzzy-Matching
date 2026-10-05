@@ -69,8 +69,22 @@ ADDR_ABBREV = {
     'post office': 'po', 'first': '1st', 'second': '2nd', 'third': '3rd',
     'fourth': '4th', 'fifth': '5th', 'sixth': '6th', 'seventh': '7th',
     'eighth': '8th', 'ninth': '9th', 'tenth': '10th', 'mount': 'mt',
-    'fort': 'ft', 'doctor': 'dr',
+    'fort': 'ft', 'doctor': 'dr', 'saint': 'st',
 }
+
+# City names get their own, smaller map. ADDR_ABBREV cannot be reused: it would
+# turn 'Court' or 'Place' inside a city name into street-type codes. Mapping
+# applies to both sides, so 'St Louis' / 'Saint Louis' and 'Ft Worth' /
+# 'Fort Worth' compare equal instead of scoring 84 and 89 - below the coverage
+# tier's `city >= 90` same-place test.
+CITY_ABBREV = {
+    'saint': 'st', 'sainte': 'ste', 'fort': 'ft', 'mount': 'mt',
+    'north': 'n', 'south': 's', 'east': 'e', 'west': 'w',
+}
+
+# 'N.W.' cleans to 'n w' - two tokens that never equal 'nw' or 'Northwest'.
+# Applied by norm_addr only; a city has no compound directionals worth merging.
+SPLIT_DIRECTIONAL_RE = re.compile(r'\b([ns]) ([ew])\b')
 
 ALIAS_RE = re.compile(
     r'\((?:\s*(?:fka|f/k/a|aka|a/k/a|dba|d/b/a|formerly(?:\s+known\s+as)?|'
@@ -113,7 +127,14 @@ def norm_addr(s):
     if not s:
         return ''
     s = re.sub(r'\bp\s*o\s*box\b', 'po box', s)
-    return ' '.join(ADDR_ABBREV.get(t, t) for t in s.split())
+    s = ' '.join(ADDR_ABBREV.get(t, t) for t in s.split())
+    # After the abbreviations, so 'N.W.', 'N W', 'North West' and 'Northwest'
+    # all reach 'nw'.
+    return SPLIT_DIRECTIONAL_RE.sub(r'\1\2', s)
+
+
+def norm_city(s):
+    return ' '.join(CITY_ABBREV.get(t, t) for t in _clean(s).split())
 
 
 def street_number(s):
@@ -942,7 +963,7 @@ def load_definitive(blocks, extra_identity=None):
     sp = d['DHC_Name'].map(split_name)
     d['d_primary'] = [p for p, a in sp]
     d['d_aliases'] = [a for p, a in sp]
-    d['d_city_n'] = d['DHC_City'].map(_clean)
+    d['d_city_n'] = d['DHC_City'].map(norm_city)
     d['d_state'] = d['DHC_State'].map(norm_state)
     d['d_zip5'] = d['DHC_Zip'].map(norm_zip5)
     return d.reset_index(drop=True)
@@ -1029,7 +1050,7 @@ def location_index(L, need_ids):
             'n': len(g),
             'names': names[:LOC_CAP], 'addrs': addrs[:LOC_CAP],
             'addr_geo': geo,
-            'cities': {_clean(x) for x in g.Loc_City
+            'cities': {norm_city(x) for x in g.Loc_City
                        if isinstance(x, str)} - {''},
             'states': {norm_state(x) for x in g.Loc_State
                        if isinstance(x, str)} - {''},
@@ -1143,7 +1164,7 @@ def cmd_run(cfg, out_prefix, reverse=True, definitive_from=None):
         z['DHC_Id_Conflict'] = False
 
     # Pooled candidates, normalised once per entity rather than per comparison.
-    z['Z_Cities_N'] = [[_clean(x) for x in v if _clean(x)] for v in z.Z_Cities]
+    z['Z_Cities_N'] = [[norm_city(x) for x in v if norm_city(x)] for v in z.Z_Cities]
     z['Z_States_N'] = [sorted({norm_state(x) for x in v} - {''})
                        for v in z.Z_States]
     z['Z_Zips_N'] = [sorted({norm_zip5(x) for x in v} - {''})

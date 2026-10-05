@@ -32,7 +32,7 @@ The coverage gap is about four times larger than the accuracy question, and was 
 The tool reads Zeus live (read-only, so it cannot change anything) and compares it with four Definitive exports: hospitals, physician groups, GPOs and about 400,000 service locations.
 
 1. **Gather everything Zeus knows about each entity.** Every name and address it holds across its client, work-location and other records.
-2. **Tidy both sides so they compare fairly.** For example, Zeus says "California" where Definitive says "CA", and many hospitals have been renamed, so former names such as "(FKA …)" count too.
+2. **Tidy both sides so they compare fairly.** For example, Zeus says "California" where Definitive says "CA"; "St.", "Street" and "Saint" are treated alike, as are "N.W." and "Northwest"; and many hospitals have been renamed, so former names such as "(FKA …)" count too. The full rules are in [Matching_Logic.md](Matching_Logic.md).
 3. **Score name and address separately.** Similarity scores from 0 to 100, allowing for typos, word order and suffixes like "LLC".
 4. **Check against satellite locations, not just headquarters.** Definitive lists a system's HQ; Zeus often records the site we actually work with. Matching against every known location removed about 30% of false address mismatches.
 5. **Give a judgement.**

@@ -54,7 +54,9 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   `py build_coverage_workbook.py --candidates <run>_gap_candidates.csv
   [--accuracy <audit>_scored.csv] [--out <name>.xlsx]`
 - `run_all.py` — runs everything in order, added 2026-09-30: accuracy run,
-  coverage run, both workbooks, and scoped workbooks for each `--population`.
+  coverage run, both workbooks, and scoped workbooks for each `--population`
+  (`--population all`, added 2026-10-05, expands to every `zeus.sources`
+  label read from the config, so the list is never hard-coded).
   Calls the four scripts unchanged as subprocesses with its own
   `sys.executable`, chaining them by the `Run folder  :` line each run prints.
   The coverage run gets `--claimed` and **`--definitive-from` the accuracy
@@ -101,6 +103,12 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   2026-09-29: access to request, software and package versions, secrets and
   Databricks login, which Python to use (the `.venv` trap), and development
   notes. Update it when a dependency or connection setting changes.
+- `Matching_Logic.md` — reference for the matching itself, written 2026-10-05:
+  every normalisation map (`NOISE_TOKENS`, `ADDR_ABBREV`, `CITY_ABBREV`), how
+  names, street lines, city, state and zip are scored, the weights, the verdict
+  and tier thresholds, known limitations, and a change log of measured effects.
+  **Update it whenever a map, weight or threshold changes**, with before/after
+  figures from a replayed run.
 - `sources.yaml` — column-role and connection config. **This is the only file to
   edit when a new Definitive export arrives.**
 - **Twelve Zeus queries** — two per population, for X in Client, Work Location,
@@ -472,7 +480,7 @@ the history contains licensed Definitive exports and Zeus client records.
 Only source is tracked — the four scripts plus `run_all.py` and `dhc_hierarchy.py`, `sources.yaml`,
 the eighteen `.sql` files (twelve Zeus population queries, the Zeus phone
 query, four Definitive sources, the hospital hierarchy), this file, `Usage.md`, `Environment.md`,
-the business overview, and `.gitignore`. Everything else is deliberately ignored:
+`Matching_Logic.md`, the business overview, and `.gitignore`. Everything else is deliberately ignored:
 
 | Ignored | Why |
 |---|---|

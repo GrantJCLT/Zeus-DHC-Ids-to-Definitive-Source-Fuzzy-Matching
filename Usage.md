@@ -3,7 +3,8 @@
 How to run the Zeus ↔ Definitive Healthcare identifier audit: what to run, where
 to run it, and what you should see. For installing the prerequisites on a new
 machine, see [Environment.md](Environment.md). For why the tools behave as they
-do, see [CLAUDE.md](CLAUDE.md).
+do, see [CLAUDE.md](CLAUDE.md). For exactly how names and addresses are
+normalised and scored, see [Matching_Logic.md](Matching_Logic.md).
 
 ## What you can produce
 
@@ -79,6 +80,7 @@ What each form writes:
 | `py run_all.py` | 2: `Zeus_DHC_ID_Accuracy_Audit_<run>.xlsx`, `Zeus_DHC_ID_Coverage_Audit_<run>.xlsx`, covering all populations |
 | `py run_all.py --population WorkLocation` | 4: the same 2, **plus** `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<run>.xlsx` and `Zeus_DHC_ID_Coverage_Audit_WorkLocation_<run>.xlsx` |
 | `py run_all.py --population WorkLocation --population Client` | 6: the same 2, plus 2 for Work Location, plus 2 for Client |
+| `py run_all.py --population all` | 14: the same 2, plus 2 for each of the six labels under `zeus.sources` in the config |
 
 The run time is the same either way; each extra pair of workbooks takes under a
 minute. For the labels you can use and what each contains, see
@@ -113,7 +115,7 @@ the command exits with code 1.
 
 | Option | Effect |
 |---|---|
-| `--population <label>` | **Adds** workbooks limited to that population, beside the full ones; repeatable. Never changes what is run or scored. See [`--population` labels](#--population-labels) |
+| `--population <label>` | **Adds** workbooks limited to that population, beside the full ones; repeatable. `all` means every `zeus.sources` label in the config. Never changes what is run or scored. See [`--population` labels](#--population-labels) |
 | `--label <x>` | Suffix for both run folders |
 | `--accuracy-only` | Just the accuracy run and its workbook(s), about 3 minutes |
 | `--limit N` | Coverage scores only the first N entities: a 4-minute end-to-end test. The "extract entities = population" check shows `n/a` then, as expected |
@@ -153,7 +155,12 @@ the table:
   nearly empty. `VMS` has no testable ID-carrying entity, and its accuracy
   Summary says so rather than giving a rate.
 - **`--population` is repeatable** on `run_all.py`: each label gives its own
-  pair of workbooks. The single-workbook builders below take one label per run.
+  pair of workbooks. `--population all` builds a pair for every label,
+  including the three near-empty ones above. The single-workbook builders
+  below take one label per run, and do not accept `all`.
+- **Which to build.** `Client` and `HealthSystem` are worth building
+  alongside `WorkLocation` for any team working those records. Build `GPO`,
+  `Agency` and `VMS` only when someone asks for them.
 
 The sections below run the same steps one at a time.
 

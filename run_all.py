@@ -20,6 +20,7 @@ stops the run. The end is a summary of the checks Usage.md asks for.
 
   py run_all.py                                    # everything: 2 workbooks
   py run_all.py --population WorkLocation          # the same, plus 2 Work Location workbooks
+  py run_all.py --population all                   # the same, plus 2 per population (14)
   py run_all.py --limit 200 --label smoke          # quick end-to-end test
 """
 import argparse
@@ -69,6 +70,19 @@ def prefix_of(folder):
     return os.path.join(folder, os.path.basename(folder))
 
 
+def population_labels(config):
+    """Every zeus.sources label in the config, for --population all, so the
+    list is never hard-coded here. Checked before anything runs."""
+    import yaml
+    with open(os.path.join(HERE, config), encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    labels = [s['label'] for s in cfg.get('zeus', {}).get('sources', [])
+              if s.get('label')]
+    if not labels:
+        raise SystemExit(f'--population all: no zeus.sources labels in {config}')
+    return labels
+
+
 def summarise(log, limit):
     """The checks from Usage.md, read back from everything the steps printed."""
     problems, notes, books = [], [], []
@@ -109,7 +123,8 @@ def main():
                     help='ALSO build workbooks limited to one Zeus population, '
                          'in addition to the full ones (never instead of '
                          'them); repeatable; labels: Client, WorkLocation, '
-                         'HealthSystem, GPO, Agency, VMS')
+                         'HealthSystem, GPO, Agency, VMS, or "all" for every '
+                         'label under zeus.sources in the config')
     ap.add_argument('--label', help='suffix for both run folders')
     ap.add_argument('--accuracy-only', action='store_true',
                     help='stop after the accuracy run and its workbook(s)')
@@ -119,6 +134,8 @@ def main():
     ap.add_argument('--no-reverse', action='store_true',
                     help='accuracy run skips the reverse lookup')
     a = ap.parse_args()
+    if any(p.lower() == 'all' for p in a.population):
+        a.population = population_labels(a.config)
 
     t_start = time.time()
     log = []
