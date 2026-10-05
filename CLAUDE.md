@@ -699,6 +699,12 @@ naive alternative was measurably wrong.
    three columns and the street line is not always in the first
    (`ClientAddress1` = "Box 365", `ClientAddress2` = "417 1st Ave"). Every Zeus
    line is compared against every Definitive line and the best pair wins.
+   **Lines that name only a unit (`Ste A`, `2nd Floor`) are excluded on both
+   sides** (`is_unit_only()`, 2026-10-05). Before that, such a line competed as
+   a street with a blank number and won 181 accuracy rows, 27 of them at
+   `Address_Score` ≥ 85 with no street agreeing. A building number followed by
+   a street (`Building 9040 Fitzsimmons Dr`) is not unit-only. See
+   `Matching_Logic.md`.
 
 7. **Do not strip `group`, `associates`, `partners` or `community` from
    `NOISE_TOKENS`.** This was predicted to be necessary for physician groups and

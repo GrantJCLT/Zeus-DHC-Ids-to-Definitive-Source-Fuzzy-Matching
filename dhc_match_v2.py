@@ -153,6 +153,64 @@ def street_body(s):
     return re.sub(r'^\d+[a-z]?\s*', '', norm_addr(s)).strip()
 
 
+# Words that open a line holding only a unit ('Ste A', 'Bldg 3', 'Lbby 2',
+# 'Mail Stop 119'), after norm_addr's abbreviations. Taken from the first word
+# of every real line with no street number, Zeus and all four Definitive
+# sources, 2026-10-05. Only lines with no street number are tested, so
+# 'Tower' or 'Level' starting a real street name is safe if it has a number.
+# 'ms' is left out: 'MS Hwy 49 W' is a Mississippi highway.
+UNIT_TOKENS = {'ste', 'apt', 'bldg', 'fl', 'rm', 'unit', 'dept', 'lot', 'spc',
+               'lvl', 'pmb', 'level', 'ofc', 'office', 'frnt', 'lbby', 'lobby',
+               'mail', 'stop', 'slot', 'wing', 'tower', 'ph', 'penthouse'}
+# A leading word that only positions the unit: '2nd Floor', 'Lower Level'.
+# 'Lower Navy Hill' stays a street line because its next word is not a unit.
+UNIT_PREFIX_RE = re.compile(r'^(?:\d+(?:st|nd|rd|th)|ground|lower|upper|main)$')
+UNIT_ID_RE = re.compile(r'^(?:[a-z]?\d+[a-z]?|[a-z]|and)$')
+STREET_TYPES = {'st', 'ave', 'blvd', 'rd', 'dr', 'ln', 'ct', 'cir', 'pl',
+                'pkwy', 'hwy', 'ter', 'trl', 'sq', 'way'}
+
+
+def is_unit_only(s):
+    """True for a line that names a unit and no street: 'Ste A', '2nd Floor'.
+
+    Such a line carries no evidence of where the entity is, but addr_scores()
+    would otherwise score it as a street line with a blank number: it wins
+    selection whenever its body beats the real street line's number + body, and
+    Address_Score then drops the number's weight instead of scoring it 0.
+    Zeus '1800 Saint Julian Place' against Definitive 'Ste A' scored 83.4.
+
+    The whole line must be units: each a unit word, optionally after a
+    positioning word and followed by one identifier ('Tower 2 Ste 203',
+    'Lower Level Ccc Bldg'). Anything more is a street, so 'Building 9040
+    Fitzsimmons Dr' stays a street line, and an identifier that is a street type
+    ('Tower Place') means the line is a street too.
+    """
+    if street_number(s):
+        return False
+    t = norm_addr(s).split()
+
+    def unit_at(i):
+        """Index just past the unit word starting at t[i], or None."""
+        if i + 1 < len(t) and UNIT_PREFIX_RE.match(t[i]) and t[i + 1] in UNIT_TOKENS:
+            i += 1
+        return i + 1 if i < len(t) and t[i] in UNIT_TOKENS else None
+
+    i, seen = 0, False
+    while i < len(t):
+        j = unit_at(i)
+        if j is None:
+            return False
+        seen, i = True, j
+        if i < len(t) and unit_at(i) is None:   # its identifier
+            if t[i] in STREET_TYPES:
+                return False
+            i += 1
+            # _clean splits 'A-1' and '101 & 102' into several short tokens.
+            while i < len(t) and unit_at(i) is None and UNIT_ID_RE.match(t[i]):
+                i += 1
+    return seen
+
+
 def norm_state(s):
     s = _clean(s)
     if not s:
@@ -347,15 +405,17 @@ def name_provenance(z_names, primary, aliases, loc_names):
 
 def addr_scores(z_lines, d_lines):
     """Best pair across all address-line combinations; Zeus's street line is
-    not always in the first column.
+    not always in the first column. Unit-only lines ('Ste A') are not street
+    lines and never compete - see is_unit_only().
 
     Returns (street_number_score, street_body_score, winning_d_index,
     winning_z_line). The index identifies which Definitive line won, so the
     caller can tell an HQ match from a service-location match; the Zeus line
     says which of the pooled Zeus addresses it was compared with.
     """
-    zc = [x for x in z_lines if x and str(x).strip()]
-    dc = [(i, x) for i, x in enumerate(d_lines) if x and str(x).strip()]
+    zc = [x for x in z_lines if x and str(x).strip() and not is_unit_only(x)]
+    dc = [(i, x) for i, x in enumerate(d_lines)
+          if x and str(x).strip() and not is_unit_only(x)]
     if not zc or not dc:
         return np.nan, np.nan, None, None
     best = (-1.0, np.nan, np.nan, None, None)

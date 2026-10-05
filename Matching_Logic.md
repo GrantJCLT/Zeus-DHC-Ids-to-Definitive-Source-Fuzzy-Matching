@@ -132,6 +132,30 @@ alike (decision #6). The pair with the highest street number + street body
 wins. `Address_Match_Source` records whether the winning line was the `HQ` or
 a `Location`.
 
+**Unit-only lines never compete** (`is_unit_only()`). A line that names only a
+unit, such as `Ste A`, `Suite 300`, `Bldg 3`, `2nd Floor`, `Lower Level`,
+`Tower 2 Ste 203` or `Mail Stop 4033`, says nothing about which street the
+entity is on, so it is left out of the comparison on both sides. The street
+line beside it still competes. A line counts as unit-only only when:
+
+- it has no street number; and
+- every word is a unit word (`UNIT_TOKENS`: ste, apt, bldg, fl, rm, unit,
+  dept, lot, spc, lvl, pmb, level, ofc, office, frnt, lbby, lobby, mail, stop,
+  slot, wing, tower, ph, penthouse), a positioning word in front of one
+  (`2nd`, `ground`, `lower`, `upper`, `main`), or a short identifier after one
+  (`A`, `300`, `A-1`, `101 & 102`).
+
+So `Building 9040 Fitzsimmons Dr` and `Bldg T9 Fort Missoula Rd` stay street
+lines, because a street follows the building. `Tower Place` stays a street line
+too, because its "identifier" is a street type. A named building with no
+street, such as `Fl 2 Tuttleman Bldg`, also stays a street line, because the
+building name can match. If every line on one side is unit-only, the street
+scores are blank and `Address_Score` rests on city, state and zip.
+
+Measured over every real line on 2026-10-05: 285,948 line occurrences are
+unit-only, almost all `Ste …` from the location view's second address column.
+2,543 lines that start with a unit word are kept as street lines.
+
 ## 5. City, state and zip
 
 Each is compared against **every** site the Definitive record has, not just the
@@ -262,18 +286,13 @@ one means re-measuring against a replayed run (see the change log for how).
 8. **The selection rule and the reported score can disagree.** The best address
    pair is chosen on street number + street body, but `Address_Score` weights
    them 0.30 / 0.22. See "Known data quirks" in CLAUDE.md.
-9. **A unit-only line can win the address match and inflate the score.** A
-   line holding only a unit, such as `Ste A` or `Ste 300` in `DHC_Addr2`, has no
-   street number. Selection counts the missing number as 0, so the unit line
-   wins whenever its body happens to score above the real street line's number
-   plus body. `Address_Score` then drops the blank number's 0.30 weight instead
-   of scoring it 0. Example: Zeus `1800 Saint Julian Place` against Definitive
-   `Ste A` scores 83.4, although no street matches. Measured on the 2026-09-30
-   accuracy replay: 256 rows have a unit-only line winning on one side or the
-   other, 84 of them with `Address_Score` ≥ 60 and 28 with ≥ 85. Not yet fixed.
-   The likely fix is to exclude unit-only lines from street comparison, or to
-   join them onto the preceding line. Either way, measure it first, because 85
-   is the coverage tool's street-level threshold.
+9. **A street line with no number can still win on body alone.** Its number
+   is blank rather than 0, so `Address_Score` drops the number's 0.30 weight.
+   Unit-only lines are now excluded (section 4), but a named-building line such
+   as `Fl 2 Tuttleman Bldg`, or a line like `Medical Ofc Bldg`, still competes
+   this way. These lines are rare: 2,543 occurrences across every source.
+10. **`POB 123` is not read as a PO box.** Only `PO Box` / `P.O. Box` is, so
+    the box number is not extracted (80 occurrences).
 
 ## 9. Change log
 
@@ -340,3 +359,57 @@ neighbouring city.
 direction followed by a street *named* for a direction. `S East Ave` (South
 East Avenue) and `SE Ave` now normalise alike. That only matters when one side
 writes the other form, and it moved no tier in the replay.
+
+### 2026-10-05: unit-only lines excluded from street comparison
+
+Added `is_unit_only()`; `addr_scores()` now skips such lines on both sides
+(section 4). Before this, a line like `Ste A` had no street number, so it
+competed as a street with its number blank. It won selection whenever its body
+beat the real street line's number plus body. `Address_Score` then dropped the
+number's 0.30 weight instead of scoring it 0. For example, Zeus
+`1800 Saint Julian Place` against Definitive `Ste A` scored 83.4.
+
+The first version of the rule tested only the first word and threw away
+`Building 9040 Fitzsimmons Dr`, a building number followed by a street. The
+whole-line rule above replaced it before anything was measured.
+
+Measured by replaying the same 2026-09-30 runs against the code before this
+change (the city-abbreviation code above):
+
+**Accuracy.** 181 address scores fell, by 21 points on average, and none rose.
+Every one was a row where a unit-only line had won: 81 of them had reached
+`Address_Score` ≥ 60, and 27 had reached ≥ 85 with no street agreeing. Three
+verdicts moved from `ID corroborated` to `Probable - name agrees, address
+differs`, each a real street mismatch now visible, such as Zeus `PO Box 1449`
+against `101 Harris Rd` for Rappahannock General Hospital. `Address_Divergent`
+rose from 576 to 639. `Geo_Conflict` and `Correction_Recommended` are unchanged.
+
+**Coverage.** Unit-only lines had decided the best candidate for 14,003 of
+48,857 entities, because the location view's second address column is mostly
+suite numbers.
+
+| Tier | Before | After |
+|---|---|---|
+| Strong match | 9,682 | 9,705 |
+| Probable match | 6,506 | 6,595 |
+| Ambiguous | 8,499 | 9,412 |
+| Weak match | 7,550 | 6,606 |
+| No credible match | 16,556 | 16,475 |
+
+- **159 rows left Strong.** 45 had passed the street test (address ≥ 85) only
+  through a suite line. For example, `Glenbeigh Hospital-Cleveland` scored 95.5
+  against `Ste 210` and now scores 60.3. Most of the rest now have a rival
+  within 3 points and are `Ambiguous`.
+- **182 rows entered Strong.** 117 of them had been `Ambiguous` or below
+  because a rival's score was inflated by a suite line. Billings Clinic,
+  Advocate Medical Group and Frederick Pediatric Associates (address 100) are
+  examples.
+- **6,141 proposed ids changed**, almost all in the review tiers: 3,103
+  Ambiguous, 1,339 Weak, 895 No credible match, 673 Probable. Only 131 are in
+  Strong, and only 9 of those were Strong both before and after.
+- **Ambiguous grew by 913.** Suite-line scores had been separating rival
+  candidates on noise. Without that noise, more rivals sit within 3 points of
+  each other, which is the honest reading.
+
+The strong tier's `Matched_Via` stays mostly `Name` (7,898 of 9,705), and
+7,627 of its rows have street-level agreement (address ≥ 85).
