@@ -826,6 +826,15 @@ naive alternative was measurably wrong.
     existing value (verified by replaying the same extract with phones
     stripped).
 
+15. **City names are normalised for saint / sainte / fort / mount, but never
+    for compass words** (2026-10-05, `CITY_ABBREV`). Abbreviating `West` to
+    `w` was tried. It lifted `Des Moines` / `West Des Moines` from 80 to 91 and
+    `Las Vegas` / `North Las Vegas` from 75 to 90, past the coverage tier's
+    `city >= 90` same-place test, and promoted coverage rows to Strong on a
+    neighbouring city. Any city mapping that shortens a prefix makes the rest
+    of the string weigh more; measure it before adding one. Full figures are in
+    `Matching_Logic.md`'s change log.
+
 ## Reporting template
 
 `Zeus_DHC_ID_Accuracy_Audit.xlsx` is retained for its **shape**, which is the

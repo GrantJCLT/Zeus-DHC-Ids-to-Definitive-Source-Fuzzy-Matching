@@ -77,10 +77,13 @@ ADDR_ABBREV = {
 # applies to both sides, so 'St Louis' / 'Saint Louis' and 'Ft Worth' /
 # 'Fort Worth' compare equal instead of scoring 84 and 89 - below the coverage
 # tier's `city >= 90` same-place test.
-CITY_ABBREV = {
-    'saint': 'st', 'sainte': 'ste', 'fort': 'ft', 'mount': 'mt',
-    'north': 'n', 'south': 's', 'east': 'e', 'west': 'w',
-}
+#
+# Compass words are deliberately NOT abbreviated. Tried on 2026-10-05: shortening
+# 'West' to 'w' lifts 'Des Moines' / 'West Des Moines' from 80 to 91 and
+# 'Las Vegas' / 'North Las Vegas' from 75 to 90 - different cities, now past
+# the `city >= 90` test - and promoted rows to the coverage Strong tier on a
+# neighbouring city.
+CITY_ABBREV = {'saint': 'st', 'sainte': 'ste', 'fort': 'ft', 'mount': 'mt'}
 
 # 'N.W.' cleans to 'n w' - two tokens that never equal 'nw' or 'Northwest'.
 # Applied by norm_addr only; a city has no compound directionals worth merging.

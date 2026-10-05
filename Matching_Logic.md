@@ -139,12 +139,20 @@ winning address line.
 
 | Field | Normalisation | Score |
 |---|---|---|
-| City | `norm_city()`: cleaned, then `CITY_ABBREV`: saint → st, sainte → ste, fort → ft, mount → mt, north/south/east/west → n/s/e/w | `fuzz.ratio`, best over every pair |
+| City | `norm_city()`: cleaned, then `CITY_ABBREV`: saint → st, sainte → ste, fort → ft, mount → mt | `fuzz.ratio`, best over every pair |
 | State | `norm_state()`: full name → two-letter code; two letters kept as they are; anything else → its first two letters, uppercased | 100 if any state matches, else 0 |
 | Zip | `norm_zip5()`: digits only, first 5, left-padded with zeros (`2134` → `02134`, repairing Excel's lost zero) | 100 if any zip matches, else 0 |
 
 Cities have their own small map because the street map would turn `Court` or
 `Place` inside a city name into street codes.
+
+**Compass words are deliberately not abbreviated in cities.** That was tried
+and measured on 2026-10-05. Shortening `West` to `w` lifted `Des Moines` /
+`West Des Moines` from 80 to 91 and `Las Vegas` / `North Las Vegas` from 75 to
+90. Those are neighbouring cities, now past the coverage tool's `city >= 90`
+same-place test, and the change promoted coverage rows to the Strong tier on a
+neighbouring city. A shorter normalised string makes any remaining difference
+weigh more, so be wary of any city mapping that shortens a prefix.
 
 ### Combined address score
 
@@ -290,6 +298,45 @@ py dhc_gap_match.py --config sources.yaml --zeus <gap run>/<gap run>_zeus_extrac
   `NW` and `Northwest`.
 
 Measured by replaying `dhc_match_v2_2026_09_30_0746` and
-`dhc_gap_match_2026_09_30_0747`, before and after the change:
+`dhc_gap_match_2026_09_30_0747`, before and after the change. Replaying with
+the unchanged code reproduced the accuracy run exactly, and the coverage run
+with one score differing and no tier change, so every difference below comes
+from the change itself.
 
-MEASURED_EFFECT
+**Accuracy (12,803 entities, 11,098 testable).** No verdict moved.
+`Address_Divergent` (576), `Geo_Conflict` (27) and `Correction_Recommended` (34)
+are unchanged. 64 address scores moved, 47 up and 17 down:
+
+- Street body: 30 changed, 27 up. Mostly `Saint Mary Pl` / `St Mary Pl`, which
+  rose from 97.1 to 100.
+- City: 34 changed, 19 up. All are real variants that now score 100:
+  `Sault Sainte Marie` / `Sault Ste. Marie`, `Fort Pierce` / `Ft. Pierce`,
+  `St Croix` / `Saint Croix`.
+- The 15 city scores that fell are all pairs of genuinely different cities,
+  such as `Fort Eustis` / `Newport News` (52 → 38). They fall because a shorter
+  string leaves less incidental overlap.
+
+**Coverage (48,857 entities).**
+
+| Tier | Before | After |
+|---|---|---|
+| Strong match | 9,682 | 9,682 |
+| Probable match | 6,507 | 6,506 |
+| Ambiguous | 8,492 | 8,499 |
+| Weak match | 7,555 | 7,550 |
+| No credible match | 16,557 | 16,556 |
+
+110 entities changed tier, and 77 proposed ids changed. One row entered the
+Strong tier and one left it, both with the same proposed id: in each case a
+rival record's score crossed the 3-point margin. The other moves are almost all
+between Ambiguous and Weak or Probable, the same margin effect on near-ties.
+
+**Tried and reverted:** abbreviating compass words in city names (see section
+5). It moved 206 entities, added 7 to the Strong tier, and promoted rows such as
+`Des Moines Eye Surgeons` (Des Moines against West Des Moines) to Strong on a
+neighbouring city.
+
+**A side effect to know about:** merging split directions also merges a
+direction followed by a street *named* for a direction. `S East Ave` (South
+East Avenue) and `SE Ave` now normalise alike. That only matters when one side
+writes the other form, and it moved no tier in the replay.
