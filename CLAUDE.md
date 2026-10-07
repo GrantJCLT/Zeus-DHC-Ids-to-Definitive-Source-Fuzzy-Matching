@@ -83,9 +83,27 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   `Zeus_Link_Status`), `_contradictions.csv`, `_zeus_links_replaced.csv`,
   `_zeus_links_dropped.csv`, `_resolution.csv`, the input snapshots, and
   `Zeus_Entity_Hierarchy_<run>.xlsx`. Nine identity checks in `X == Y  OK`
-  form. A replay from its own folder is byte-identical
+  form (ten with readiness). A replay from its own folder is byte-identical
   (verified 2026-10-07). The rules are in `Hierarchy_Logic.md`; the decisions
   are #16-#18 below.
+  **Migration readiness since 2026-10-07:** `Zeus migration readiness.sql`
+  (`migration.query_file`, Databricks) unions the migration team's
+  `qat_gold.crmmig_rules.healthsystem_summary`, `client_summary` and
+  `worklocation_summary`, whose keys (`HealthSystemInfoId`, `ClientInfoId`,
+  `WorkLocationInfoId`) are each the Zeus `EntityId`. Each node gets
+  `Ready_For_Migration` from the table of its own `Entity_Type`, falling back
+  to another table, highest type first, only where that one has no row
+  (`Ready_For_Migration_From`), plus each table's own flag
+  (`Ready_<Type>_Summary`) and `Ready_Tables_Disagree`, all right after
+  `In_Scope` on the Hierarchy sheet and in `_hierarchy_nodes.csv`; a Summary
+  section counts them. Keys are unique per table but 1,288 EntityIds are in
+  more than one table (Grant chose own-type-first, 2026-10-07). Snapshotted as
+  `<run>_migration_readiness.parquet` / `.sql`; `--migration-from <run>`
+  replays it, `--no-migration` leaves the columns out (byte-identical to the
+  earlier output). Measured on `zeus_hierarchy_2026_10_07_1550_migration`:
+  16,887 ready, 55,253 not, 61 in no table (all but one in scope), 18 from
+  another type's table, 81 health systems whose tables disagree. Nothing else
+  in the outputs changes.
 - `Hierarchy_Logic.md` — reference for the Zeus hierarchy, written
   2026-10-07: nodes, universe, resolution bases, the Definitive parent walk,
   every `Zeus_Link_Status`, the Zeus tie-break, duplicates, measured results,
@@ -127,10 +145,24 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   populates `IdNetwork` without `SfParentAccountId`. Physician groups behave
   the same way (2026-10-07): 6,205 of 143,617 have a parent, every one through
   `SF_PARENT_ACCOUNT_ID`, pointing at a hospital (2,358), a health system
-  (1,080) or a corporate owner in neither view (2,767). GPOs and practice
-  locations stay out: the GPO view has no parent column, and a practice
-  location has no stable id of its own (`LocationId` is unique per
-  physician-location row).
+  (1,080) or a corporate owner in neither view (2,767).
+  **Practice locations are leaves since 2026-10-07** (decision #19): the
+  audits' own `locations:` block and `Definitive Practice Locations.sql`,
+  unchanged, add one node per location one level below its parent record,
+  keyed `Location_Key` (`L<parent id>-<hash>`); every file then leads with
+  `Node_Id` and gains `Location_*` columns. `--no-locations` reproduces the
+  records-only output byte for byte, and is the only way to replay a
+  hierarchy run without a `_dhc_practicelocations` snapshot. They are added
+  after `walk()`, so `zeus_hierarchy.py` (which imports `load_hierarchy()` and
+  `walk()`) never sees them. Run `dhc_hierarchy_2026_10_07_1515`: 549,894
+  nodes = 153,508 records + 396,386 locations, 195,219 trees, depth ≤ 4;
+  326,844 locations sit under a record (300,039 physician groups, 23,482
+  hospitals, 3,059 health systems), 69,542 under 54,326 parent ids in no
+  view (10 of them GPOs), flagged `Parent_Not_In_Definitive`. About 6 min;
+  the workbook is ~167 MB. **GPOs stay out** (Grant, 2026-10-07): they are
+  purchasing affiliations, not owners. `hospitaloverview.PrimaryGpoId`
+  (7,770 of 9,891, all resolving to the GPO view) is the link if a GPO
+  affiliation layer is ever wanted.
 - `Zeus_DHC_ID_Audit_Business_Overview.md` — plain-language overview of the
   project for business readers, written 2026-09-28 from the 2026-08-12 and
   2026-08-19 runs. Its figures are hand-copied, so update it after a new run.
@@ -550,9 +582,9 @@ The folder is a git repo with a **private** GitHub remote,
 the history contains licensed Definitive exports and Zeus client records.
 
 Only source is tracked — the four scripts plus `run_all.py`, `dhc_hierarchy.py` and `zeus_hierarchy.py`, `sources.yaml`,
-the twenty-two `.sql` files (twelve Zeus population queries, the Zeus phone
+the twenty-three `.sql` files (twelve Zeus population queries, the Zeus phone
 query, the three Zeus hierarchy queries, four Definitive sources, the hospital
-and physician-group hierarchies), this file, `Usage.md`, `Environment.md`,
+and physician-group hierarchies, the migration readiness query), this file, `Usage.md`, `Environment.md`,
 `Matching_Logic.md`, `Hierarchy_Logic.md`, the business overview, and `.gitignore`. Everything else is deliberately ignored:
 
 | Ignored | Why |
@@ -971,7 +1003,23 @@ naive alternative was measurably wrong.
     resolve to, and ~2,500 accuracy ids plus ~6,500 strong coverage proposals
     are physician groups. Same columns and same parent rule as the hospital
     file, unioned in `load_hierarchy()`; ids never overlap between the views,
-    and a run stops if they do. GPOs and practice locations stay out.
+    and a run stops if they do. GPOs and practice locations stay out of
+    *this* union; locations are added afterwards (decision #19).
+
+19. **Practice locations are leaves keyed by a derived key; GPOs are not in
+    the ownership hierarchy** (2026-10-07, Grant). Locations come from the
+    audits' `Definitive Practice Locations.sql`, unchanged, because its
+    `GROUP BY` is already one row per location of a known parent. Definitive
+    has no usable location id: `LocationId` and `AddressId` are unique per
+    physician row (4,636,059 of each), and `PhysicianGroupLocationId` is null
+    on 3,246,445 rows and spans more than one address for 12,213 of its
+    233,498 ids. So `Location_Key` = `L<parent id>-` + 12 hex of a SHA-1 over
+    the grouped name, address lines, city, state and zip, with NULL and ''
+    hashed apart. It is stable while those fields are, and changes when a
+    location is renamed or moves; do not treat it as a Definitive id. A
+    location is never a parent. GPOs are excluded because a GPO is a
+    purchasing affiliation, not an owner; making one a parent would change
+    the top-level owner of ~7,800 records.
 
 ## Reporting template
 

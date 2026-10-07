@@ -237,3 +237,14 @@ hierarchy:
     snapshot: physiciangrouphierarchy # <run>_dhc_physiciangrouphierarchy.parquet
     id: HospitalId
     name: HospitalName
+
+# ---------------------------------------------------------------------------
+# MIGRATION readiness: read by zeus_hierarchy.py only (2026-10-07).
+#
+# The migration team's ready_for_migration flag from qat_gold.crmmig_rules
+# (healthsystem_summary, client_summary, worklocation_summary), one row per
+# Zeus EntityId per table. Queried once per run and snapshotted as
+# <run>_migration_readiness.parquet / .sql; --migration-from replays it.
+# ---------------------------------------------------------------------------
+migration:
+  query_file: Zeus migration readiness.sql

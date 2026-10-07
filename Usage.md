@@ -12,7 +12,7 @@ normalised and scored, see [Matching_Logic.md](Matching_Logic.md).
 |---|---|---|---|
 | **Accuracy**: of the Zeus entities that carry a DHC ID, how many point at the right Definitive record? | `dhc_match_v2.py run` | `Zeus_DHC_ID_Accuracy_Audit_<date>_<time>.xlsx` | 2–3 min |
 | **Coverage**: which Zeus entities carry no DHC ID, and which Definitive record should each one point at? | `dhc_gap_match.py` | `Zeus_DHC_ID_Coverage_Audit_<date>_<time>.xlsx` | 20–30 min |
-| **Definitive hierarchy**: how Definitive's hospitals, health systems and physician groups nest under their owners | `dhc_hierarchy.py` | `Definitive_Ownership_Hierarchy_<date>_<time>.xlsx` plus `<run>_hierarchy.csv` | about 1.5 min |
+| **Definitive hierarchy**: how Definitive's hospitals, health systems, physician groups and their practice locations nest under their owners | `dhc_hierarchy.py` | `Definitive_Ownership_Hierarchy_<date>_<time>.xlsx` plus `<run>_hierarchy.csv` | about 6 min (1.5 with `--no-locations`) |
 | **Zeus hierarchy**: one Health System > Client > Work Location tree for Zeus, from Definitive ownership first and Zeus links second; a read-only baseline to validate the migration team's hierarchy against | `zeus_hierarchy.py` | `Zeus_Entity_Hierarchy_<date>_<time>.xlsx` plus `<run>_hierarchy_edges.csv` | about 1 min, once both audits exist |
 | **Optional extra:** the same answers limited to one Zeus population, e.g. Work Locations for the third-party data-cleaning group. **An extra workbook alongside the full one, never instead of it** | the same runs, plus a build with `--population WorkLocation` | `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<date>_<time>.xlsx` and `..._Coverage_Audit_WorkLocation_...` | seconds, once the runs exist |
 
@@ -529,13 +529,31 @@ data can be compared on either key. `--definitive-from <hierarchy run folder>`
 replays that run's snapshots, and the output is byte-identical. A run from
 before 2026-10-07 has no physician-group snapshot and cannot be replayed.
 
+**Practice locations** (since 2026-10-07) are added as leaves, one level below
+the record that owns them. They come from the same `locations:` block and
+`Definitive Practice Locations.sql` the audits use, unchanged. Definitive gives
+a location no stable id, so each gets a derived `Location_Key`,
+`L<parent id>-<12 hex>`, hashed from its name, address, city, state and zip. It
+changes when the location is renamed or moves. Every output then leads with
+`Node_Id` (the `HospitalId`, or the `Location_Key`), and a location row has
+`TypeFirm = Practice Location`, `Immediate_Parent_Rule =
+PracticeLocationHospitalId`, a blank `HospitalId`, and `Location_Key`,
+`Location_Address` and `Location_Zip` filled. Records gain `Location_Count`
+(their own locations) and `Tree_Location_Count`, and their
+`Immediate_Child_Count` and `Descendant_Count` now include locations.
+`--no-locations` leaves them out: the output is then exactly the records-only
+shape, and that is the only way to replay a hierarchy run from before
+2026-10-07 15:15, which has no `_dhc_practicelocations` snapshot. GPOs are not
+in the hierarchy: they are purchasing affiliations, not owners.
+
 Every record gets **two parents, labelled**, because the tree runs up to four
-levels deep (system > division or region > hospital > physician group), and the
+levels deep (system > division or region > hospital > physician group), five
+with a practice location below that, and the
 destination system may model either grain:
 
 | Prefix | Meaning | Example for Medical City Denton |
 |---|---|---|
-| `Immediate_Parent*` | The direct owner, in the full tree. `Immediate_Level` is 0 for a root and up to 3 below it | HCA Medical City Healthcare (North Texas Division) |
+| `Immediate_Parent*` | The direct owner, in the full tree. `Immediate_Level` is 0 for a root and up to 4 below it (3 without locations) | HCA Medical City Healthcare (North Texas Division) |
 | `Ultimate_Parent*` | The top-level owner, with the tree flattened to two levels. `Ultimate_Level` is 0 or 1 | HCA Healthcare |
 
 They differ only for records with `Has_Intermediate_Parent = True`. A root is
@@ -553,19 +571,25 @@ Written to `Results Output/dhc_hierarchy_<date>_<time>/`:
   `Immediate_Child_Count`, `Descendant_Count`, `Hierarchy_Issue`, and the Zeus
   columns. Hand the migration team the edge list that matches their grain, or
   this file if they want both.
-- `<run>_dhc_hospitalhierarchy.parquet` / `.sql` and
-  `<run>_dhc_physiciangrouphierarchy.parquet` / `.sql`: the snapshots and the
-  SQL that produced them.
+- `<run>_dhc_hospitalhierarchy.parquet` / `.sql`,
+  `<run>_dhc_physiciangrouphierarchy.parquet` / `.sql` and
+  `<run>_dhc_practicelocations.parquet` / `.sql`: the snapshots and the SQL
+  that produced them.
 - `Definitive_Ownership_Hierarchy_<date>_<time>.xlsx`: Summary (records by
   level and type, immediate versus ultimate, by rule, largest ultimate
   parents, identity checks), Methodology, Immediate_Parent, Ultimate_Parent,
   Hierarchy, Roots (those that own something), Hierarchy_Issues, and
   Zeus_Linked if `--accuracy` was given.
 
-What you should see (2026-10-07): 153,508 records (8,710 hospitals, 1,181
-health systems, 142,819 physician groups, 467 MSOs, 331 IPAs), 142,595 trees
-(1,566 with more than one member), maximum depth 3, 2,768
-`Parent_Not_In_Definitive` rows, and four checks ending `OK`. Almost all of
+What you should see (2026-10-07, run `dhc_hierarchy_2026_10_07_1515`):
+549,894 nodes, which are 153,508 records (8,710 hospitals, 1,181 health
+systems, 142,819 physician groups, 467 MSOs, 331 IPAs) plus 396,386 practice
+locations. They form 195,219 trees, maximum depth 4. 326,844 locations sit
+under a record and 69,542 under a parent in no view. There are 86,977
+`Parent_Not_In_Definitive` rows, and eight checks ending `OK`. The workbook is
+about 167 MB. With `--no-locations`: 142,595 trees (1,566 with more than one
+member), maximum depth 3, 2,768 `Parent_Not_In_Definitive` rows, and four
+checks. Almost all of
 those 2,768 are physician groups owned by a corporate parent that is in
 neither view (The US Oncology Network, AMSURG, RadNet, Village Medical, ...);
 they are kept, named from `SfParentAccountName`, and flagged. 95.7% of
@@ -628,9 +652,29 @@ The column to act on is `Zeus_Link_Status`:
 | `Zeus only` | Definitive has no parent for it; the Zeus link is used |
 | `No parent` | Neither source has one, or a loop was broken here (`Tree_Issue` says so). Expected for a client with no health system; an orphan for a work location |
 
+**Migration readiness** (since 2026-10-07): the Hierarchy sheet and
+`_hierarchy_nodes.csv` carry the migration team's `ready_for_migration`, read
+live from `qat_gold.crmmig_rules` through `Zeus migration readiness.sql`.
+Three tables: `healthsystem_summary`, `client_summary`, `worklocation_summary`.
+Each is keyed by an `*InfoId` that is the Zeus `EntityId`. The columns sit
+right after `In_Scope`:
+
+| Column | Meaning |
+|---|---|
+| `Ready_For_Migration` | 1 ready, 0 not, blank in none of the tables. Taken from the table of the entity's own `Entity_Type` |
+| `Ready_For_Migration_From` | The table used. It differs from the entity's own type only where that table has no row; then the next table, highest type first, is used |
+| `Ready_HealthSystem_Summary`, `Ready_Client_Summary`, `Ready_WorkLocation_Summary` | Each table's own flag, blank where it has no row. Some EntityIds are in several tables |
+| `Ready_Tables_Disagree` | True where those flags differ |
+
+The Summary sheet counts them by type, and an identity check confirms that
+ready + not ready + in no table = nodes. On 2026-10-07: 16,887 ready, 55,253
+not, 61 in no table, 81 health systems whose tables disagree.
+`--migration-from <run folder>` replays an earlier run's
+`_migration_readiness.parquet`. `--no-migration` leaves the columns out.
+
 `--zeus-links <run folder>` and `--definitive-hierarchy <run folder>` both
-accept an earlier `zeus_hierarchy` run, and with the same audit files the
-output is byte-identical. Without `--zeus-links` the three Zeus queries
+accept an earlier `zeus_hierarchy` run, and with the same audit files (and
+`--migration-from` the same folder) the output is byte-identical. Without `--zeus-links` the three Zeus queries
 (`Zeus hierarchy links.sql`, `Zeus linked import entities.sql`,
 `Zeus entity duplicates.sql`) run live, in seconds.
 

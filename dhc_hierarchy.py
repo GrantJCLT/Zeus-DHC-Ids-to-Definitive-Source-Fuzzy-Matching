@@ -35,6 +35,7 @@ Writes into its own folder, "Results Output/dhc_hierarchy_<YYYY_MM_DD_HHMM>/":
 accuracy run, so the output can be compared by either key.
 """
 import argparse
+import hashlib
 import os
 
 import pandas as pd
@@ -92,6 +93,115 @@ def load_hierarchy(cfg, prefix, definitive_from=None):
                          f'({sorted(dup.Source_View.unique())}); Definitive ids '
                          f'are meant to be one namespace with no overlap.')
     return df
+
+
+def load_locations(cfg, prefix, definitive_from=None):
+    """The practice locations under `locations:` (the audits' own block and
+    query, unchanged), queried live or replayed, one row per location of a
+    known parent. Returns (frame, block) so callers can read the role names."""
+    blocks = [dict(b) for b in cfg.get('locations') or []]
+    if len(blocks) != 1:
+        raise SystemExit(f'Expected one block under `locations:`, found '
+                         f'{len(blocks)}; or pass --no-locations.')
+    if definitive_from:
+        materialise_tables({'locations': blocks}, definitive_from,
+                           replay=True, copy_to=prefix)
+    else:
+        materialise_tables({'databricks': cfg.get('databricks'),
+                            'locations': blocks}, prefix)
+    b = blocks[0]
+    df = pd.read_parquet(b['path'])
+    df[b['id']] = pd.to_numeric(df[b['id']]).astype('Int64')
+    return df, b
+
+
+def location_keys(loc, b):
+    """`L<parent id>-<12 hex>`: a hash of the fields the location query groups
+    by (decision #19). A location has no stable id of its own in Definitive -
+    LocationId is per physician row and PhysicianGroupLocationId is null on
+    most rows and spans several addresses - so the key is derived. It is
+    stable while those fields are; a renamed or moved location gets a new
+    key. NULL and '' hash differently, and the separator is a control
+    character, so distinct rows cannot collide by concatenation."""
+    addr = b.get('address') or []
+    fields = [b['name']] + (addr if isinstance(addr, list) else [addr]) + \
+        [b[k] for k in ('city', 'state', 'zip') if b.get(k)]
+    vals = loc[fields].astype(object)
+    joined = ['\x1f'.join('\x00' if pd.isna(v) else str(v) for v in row)
+              for row in vals.itertuples(index=False)]
+    return pd.Series(
+        [f'L{p}-{hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]}'
+         for p, s in zip(loc[b['id']], joined)], index=loc.index)
+
+
+def add_locations(h, loc, b):
+    """Every practice location as a leaf one level below its parent record.
+
+    The walked records are unchanged except for their counts: Child_Count and
+    Descendant_Count are recomputed over records and locations together, and
+    Location_Count / Tree_Location_Count are added. A location whose parent
+    is in no hierarchy view (a corporate owner, or one of the 10 GPOs, which
+    are excluded) is placed under that id as its root and flagged
+    Parent_Not_In_Definitive, as a record would be."""
+    pid = loc[b['id']]
+    rec = h.set_index('HospitalId')
+    known = pid.isin(rec.index)
+    # Names of ids that are parents but not records, as the walk named them.
+    ext = h.loc[~h.Parent_In_Definitive, ['ParentId', 'ParentName']] \
+        .drop_duplicates('ParentId').set_index('ParentId').ParentName
+    addr = b.get('address') or []
+    addr = addr if isinstance(addr, list) else [addr]
+    key = location_keys(loc, b)
+    name = loc[b['name']].astype(object).where(loc[b['name']].notna(), '')
+
+    def up(col, default=None):
+        """The parent record's value of `col`, or `default` off-view."""
+        v = pid.map(rec[col]).astype(object)
+        return v.where(known, default)
+
+    pname = up('HospitalName').where(known, pid.map(ext))
+    l = pd.DataFrame({
+        'HospitalId': pd.array([pd.NA] * len(loc), dtype='Int64'),
+        'HospitalName': name,
+        'TypeFirm': 'Practice Location',
+        'HqCity': loc[b['city']] if b.get('city') else None,
+        'HqState': loc[b['state']] if b.get('state') else None,
+        'Source_View': b['snapshot'],
+        'Is_Root': False,
+        'ParentId': pid,
+        'ParentName': pname,
+        'Parent_TypeFirm': up('TypeFirm'),
+        'Parent_Rule': b['id'],
+        'Parent_In_Definitive': known,
+        'Level': (up('Level', 0).astype(int) + 1),
+        'RootId': pd.array(up('RootId', None).where(known, pid), dtype='Int64'),
+        'RootName': up('RootName').where(known, pname),
+        'Root_TypeFirm': up('Root_TypeFirm'),
+        'Ultimate_Level': 1,
+        'Path_Ids': up('Path_Ids').where(known, pid.astype(str)) + SEP + key,
+        'Path_Names': up('Path_Names').where(known, pname.fillna('').astype(str))
+                      + SEP + name.astype(str),
+        'Hierarchy_Issue': up('Hierarchy_Issue', 'Parent_Not_In_Definitive'),
+        'Node_Id': key,
+        'Location_Key': key,
+        'Location_Address': loc[addr].astype(object).bfill(axis=1).iloc[:, 0]
+                            if addr else None,
+        'Location_Zip': loc[b['zip']] if b.get('zip') else None,
+    })
+    l['Has_Intermediate_Parent'] = l.ParentId != l.RootId
+    h = h.copy()
+    h['Node_Id'] = h.HospitalId.astype(str)
+    out = pd.concat([h, l], ignore_index=True)
+    kids = out[~out.Is_Root].groupby('ParentId').size()
+    out['Child_Count'] = out.HospitalId.map(kids).fillna(0).astype(int)
+    desc = pd.Series(
+        [int(x) for p in out.Path_Ids for x in p.split(SEP)[:-1]]).value_counts()
+    out['Descendant_Count'] = out.HospitalId.map(desc).fillna(0).astype(int)
+    out['Location_Count'] = out.HospitalId.map(
+        l.groupby('ParentId').size()).fillna(0).astype(int)
+    out['Tree_Location_Count'] = out.RootId.map(
+        l.groupby('RootId').size()).fillna(0).astype(int)
+    return out
 
 
 def walk(df):
@@ -205,6 +315,15 @@ IMMEDIATE = ['HospitalId', 'HospitalName', 'TypeFirm', 'ParentId',
 ULTIMATE = ['HospitalId', 'HospitalName', 'TypeFirm', 'RootId', 'RootName',
             'Root_TypeFirm', 'Ultimate_Level', 'Is_Root',
             'Has_Intermediate_Parent']
+# With practice locations in, every node also has a Node_Id (the HospitalId
+# as text, or the Location_Key), which leads each file. Without them
+# (--no-locations) the outputs are exactly the pre-locations shape.
+LOCATION_COLUMNS = ['Location_Key', 'Location_Address', 'Location_Zip',
+                    'Location_Count', 'Tree_Location_Count']
+
+
+def _cols(h, cols):
+    return (['Node_Id'] + cols) if 'Node_Id' in h else cols
 
 
 def labelled(df, cols=None):
@@ -215,14 +334,14 @@ def labelled(df, cols=None):
 
 def immediate_edges(h):
     """Record -> direct owner: the full tree as a child/parent edge list."""
-    return labelled(h, IMMEDIATE)
+    return labelled(h, _cols(h, IMMEDIATE))
 
 
 def ultimate_edges(h):
     """Record -> top-level owner: the tree flattened to two levels. The
     immediate parent is kept only where it differs, as Intermediate_*, so the
     flattened view still shows the tier it skipped."""
-    u = labelled(h, ULTIMATE)
+    u = labelled(h, _cols(h, ULTIMATE))
     mid = h.sort_values(['RootId', 'Path_Ids'])
     u['Intermediate_ParentId'] = mid.ParentId.where(
         mid.Has_Intermediate_Parent).astype('Int64')
@@ -233,7 +352,7 @@ ZEUS_COLUMNS = ['Zeus_Entity_Count', 'Zeus_EntityIds', 'Zeus_Sources',
                 'Zeus_Verdicts', 'Tree_Zeus_Entity_Count']
 
 
-def checks(h):
+def checks(h, n_loc=None):
     """Identities that must hold, as (label, left, right): printed as
     `label  left == right  OK|FAIL` - the form run_all.py collects - and
     written to the Summary."""
@@ -241,16 +360,33 @@ def checks(h):
     # Records under a root that is not itself a Definitive record (its id is
     # a parent missing from the view) belong to no root's Descendant_Count.
     orphaned = int((~h.RootId.isin(roots.HospitalId)).sum())
-    return [
-        ('records with exactly one parent = records',
+    n = 'nodes' if 'Node_Id' in h else 'records'
+    rows = [
+        (f'{n} with exactly one parent = {n}',
          int(h.ParentId.notna().sum()), len(h)),
-        ('level 0 records = self-parented roots',
+        (f'level 0 {n} = self-parented roots',
          int((h.Level == 0).sum()), int(h.Is_Root.sum())),
-        ('roots + descendants + under missing parents = records',
+        (f'roots + descendants + under missing parents = {n}',
          int(len(roots) + roots.Descendant_Count.sum() + orphaned), len(h)),
-        ('records in a cycle = 0',
+        (f'{n} in a cycle = 0',
          int((h.Hierarchy_Issue == 'Cycle').sum()), 0),
     ]
+    if 'Node_Id' in h:
+        locs = h[h.Location_Key.notna()]
+        rows += [
+            ('Node_Id unique = nodes', int(h.Node_Id.nunique()), len(h)),
+            ('locations attached = location snapshot rows', len(locs),
+             int(n_loc if n_loc is not None else -1)),
+            ('location Level = parent Level + 1 (records)',
+             int((locs.Level == locs.ParentId.map(
+                 h[h.HospitalId.notna()].set_index('HospitalId').Level)
+                 .fillna(0) + 1).sum()),
+             len(locs)),
+            ('sum of Location_Count = locations under a record',
+             int(h.Location_Count.sum()),
+             int(locs.Parent_In_Definitive.sum())),
+        ]
+    return rows
 
 
 def print_checks(rows):
@@ -263,7 +399,7 @@ def _xl(df):
     return df.astype(object).where(df.notna(), None)
 
 
-def build_workbook(h, path, run, zeus_info):
+def build_workbook(h, path, run, zeus_info, n_loc=None):
     wb = Workbook()
     wb.remove(wb.active)
     ws = wb.create_sheet('Summary')
@@ -295,7 +431,11 @@ def build_workbook(h, path, run, zeus_info):
          f'owner). They differ for the {int(h.Has_Intermediate_Parent.sum()):,} '
          f'records owned through a division or region. {len(ext):,} '
          f'record(s) name a parent that is in none of the views. They are '
-         f'kept, and flagged on Hierarchy_Issues.', align=WRAP)
+         f'kept, and flagged on Hierarchy_Issues.'
+         + (f' The {n_loc:,} Practice Location rows are practice locations: '
+            f'leaves one level below the record that owns them, each keyed by '
+            f'a Location_Key derived from its fields. GPOs are not in this '
+            f'hierarchy.' if n_loc is not None else ''), align=WRAP)
 
     r = _table(ws, 10, ['Immediate_Level', 'Records'] + list(types.index),
                [[int(lv), len(g)] + [int((g.TypeFirm.fillna('(blank)') == t)
@@ -315,14 +455,27 @@ def build_workbook(h, path, run, zeus_info):
     r = _table(ws, r, ['Parent decided by', 'Records', 'Of which roots'],
                [[k, len(g), int(g.Is_Root.sum())]
                 for k, g in h.groupby('Parent_Rule')])
-    big = (h.groupby(['RootId', 'RootName'], dropna=False)
-           .agg(n=('HospitalId', 'size'), d=('Level', 'max'))
-           .sort_values('n', ascending=False).head(15).reset_index())
-    _put(ws, f'B{r}', 'Largest ultimate parents', SECTION)
-    r = _table(ws, r + 1, ['Ultimate parent', 'Ultimate_ParentId',
-                           'Records in tree', 'Depth'],
-               [[x.RootName, int(x.RootId), int(x.n), int(x.d)]
-                for x in big.itertuples()])
+    if n_loc is None:
+        big = (h.groupby(['RootId', 'RootName'], dropna=False)
+               .agg(n=('HospitalId', 'size'), d=('Level', 'max'))
+               .sort_values('n', ascending=False).head(15).reset_index())
+        _put(ws, f'B{r}', 'Largest ultimate parents', SECTION)
+        r = _table(ws, r + 1, ['Ultimate parent', 'Ultimate_ParentId',
+                               'Records in tree', 'Depth'],
+                   [[x.RootName, int(x.RootId), int(x.n), int(x.d)]
+                    for x in big.itertuples()])
+    else:
+        big = (h.groupby(['RootId', 'RootName'], dropna=False)
+               .agg(n=('HospitalId', 'count'), l=('Location_Key', 'count'),
+                    d=('Level', 'max'))
+               .sort_values(['n', 'l'], ascending=False).head(15)
+               .reset_index())
+        _put(ws, f'B{r}', 'Largest ultimate parents', SECTION)
+        r = _table(ws, r + 1, ['Ultimate parent', 'Ultimate_ParentId',
+                               'Records in tree', 'Locations in tree',
+                               'Depth'],
+                   [[x.RootName, int(x.RootId), int(x.n), int(x.l), int(x.d)]
+                    for x in big.itertuples()])
     if zeus_info:
         n_scored, n_in = zeus_info
         linked = h[h.Zeus_Entity_Count > 0]
@@ -337,7 +490,7 @@ def build_workbook(h, path, run, zeus_info):
              int(linked.RootId.nunique())]])
     _put(ws, f'B{r}', 'Identity checks', SECTION)
     r = _table(ws, r + 1, ['Check', 'Left', 'Right', 'Result'],
-               [[k, a, b, 'OK' if a == b else 'FAIL'] for k, a, b in checks(h)])
+               [[k, a, b, 'OK' if a == b else 'FAIL'] for k, a, b in checks(h, n_loc)])
 
     build_methodology(wb, [
         ('Source', 'One Definitive view per block under `hierarchy:` in the '
@@ -346,10 +499,20 @@ def build_workbook(h, path, run, zeus_info):
                    'health systems appear as ordinary records and as the '
                    'parents of hospitals. Physician Group Overview was added '
                    'on 2026-10-07; a group\'s parent can be a hospital, a '
-                   'health system, or an id in neither view. GPOs and practice '
-                   'locations are not in this hierarchy: the GPO view has no '
-                   'parent column, and a practice location has no stable id '
-                   'of its own.'),
+                   'health system, or an id in neither view. '
+                   + ('Practice locations (the audits\' "Definitive Practice '
+                      'Locations.sql", one row per location of a known parent) '
+                      'were added on 2026-10-07 as leaves one level below '
+                      'their parent record (PracticeLocationHospitalId). '
+                      'Definitive gives a location no stable id, so '
+                      'Location_Key is derived: L<parent id>-<hash of name, '
+                      'address, city, state and zip>. It changes if any of '
+                      'those fields does. GPOs are excluded: a GPO is a '
+                      'purchasing affiliation, not an owner.'
+                      if n_loc is not None else
+                      'GPOs and practice locations are not in this run: GPOs '
+                      'are purchasing affiliations, not owners, and the run '
+                      'was given --no-locations.')),
         ('Parent rule', 'Immediate_ParentId = SfParentAccountId if present; '
                         'otherwise IdNetwork; otherwise the record\'s own '
                         'HospitalId, which makes it a root. '
@@ -425,6 +588,10 @@ def main():
     ap.add_argument('--definitive-from', metavar='PREFIX',
                     help='replay the hierarchy snapshot of an earlier '
                          'dhc_hierarchy run (its folder or prefix)')
+    ap.add_argument('--no-locations', action='store_true',
+                    help='leave practice locations out: the pre-2026-10-07 '
+                         'output, and the only way to replay a hierarchy run '
+                         'that has no practice location snapshot')
     ap.add_argument('--label', help='optional suffix for the run folder name')
     ap.add_argument('--results-dir', default=RESULTS_DIR)
     a = ap.parse_args()
@@ -435,6 +602,12 @@ def main():
     h = walk(load_hierarchy(cfg, prefix, src))
 
     cols = list(COLUMNS)
+    n_loc = None
+    if not a.no_locations:
+        loc, lb = load_locations(cfg, prefix, src)
+        n_loc = len(loc)
+        h = add_locations(h, loc, lb)
+        cols = ['Node_Id'] + cols + LOCATION_COLUMNS
     zeus_info = None
     if a.accuracy:
         h, n_scored, n_in = attach_zeus(h, a.accuracy)
@@ -447,7 +620,15 @@ def main():
     immediate_edges(h).to_csv(f'{prefix}_hierarchy_immediate.csv', index=False)
     ultimate_edges(h).to_csv(f'{prefix}_hierarchy_ultimate.csv', index=False)
     trees = h.groupby('RootId').size()
-    print(f'Records     : {len(h):,}  ('
+    if n_loc is not None:
+        locs = h[h.Location_Key.notna()]
+        print(f'Nodes       : {len(h):,}  ({len(h) - n_loc:,} records + '
+              f'{n_loc:,} practice locations)')
+        print(f'Locations   : {int(locs.Parent_In_Definitive.sum()):,} under a '
+              f'record, {int((~locs.Parent_In_Definitive).sum()):,} under a '
+              f'parent in no hierarchy view, across '
+              f'{locs.ParentId.nunique():,} parents')
+    print(f'{"By type" if n_loc is not None else "Records":<12}: {len(h):,}  ('
           + ', '.join(f'{n:,} {t}' for t, n in
                       h.TypeFirm.fillna('(blank)').value_counts().items()) + ')')
     for k, n in h.Source_View.value_counts().items():
@@ -464,10 +645,10 @@ def main():
         print(f'Zeus        : {zeus_info[1]:,} of {zeus_info[0]:,} scored '
               f'entities carry an id in this hierarchy; '
               f'{(h.Zeus_Entity_Count > 0).sum():,} records are Zeus-linked')
-    print_checks(checks(h))
+    print_checks(checks(h, n_loc))
     print(f'Wrote {out}  (+ _immediate.csv, _ultimate.csv)')
     wbp = workbook_path(prefix, 'Definitive_Ownership_Hierarchy')
-    build_workbook(h, wbp, os.path.basename(prefix), zeus_info)
+    build_workbook(h, wbp, os.path.basename(prefix), zeus_info, n_loc)
     print(f'Wrote {wbp}')
 
 

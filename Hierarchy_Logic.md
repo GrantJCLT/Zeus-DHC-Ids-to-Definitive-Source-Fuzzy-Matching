@@ -376,3 +376,41 @@ first full run's inputs (`zeus_hierarchy_2026_10_07_0858` replayed as
 `Agrees` fell because most agreements were a hospital's self-link, which
 single typing removes; `Definitive replaces` rose with the staffing-firm rule
 and because an owner typed HealthSystem may now be a work location's parent.
+
+### 2026-10-07: practice locations in the Definitive hierarchy (no change here)
+
+`dhc_hierarchy.py` now adds every practice location as a leaf below its
+parent record (CLAUDE.md decision #19): 396,386 locations, so run
+`dhc_hierarchy_2026_10_07_1515` has 549,894 nodes and depth 4. This tool is
+unaffected by design. It reads the hierarchy through `load_hierarchy()` and
+`walk()`, which still return records only, and `LocationOf` still comes from
+the audits' own location matching. Verified by replaying
+`zeus_hierarchy_2026_10_07_1103_singletype`'s inputs against both
+`dhc_hierarchy_2026_10_07_1459` (records only) and `..._1515` (with
+locations): every output file is byte-identical between the two and to the
+11:03 run, and all nine checks pass. GPOs remain outside both hierarchies.
+
+### 2026-10-07: migration readiness on every node
+
+Each node now carries the migration team's `ready_for_migration` from
+`qat_gold.crmmig_rules` (`Zeus migration readiness.sql`, read by
+`load_migration()` and attached by `attach_migration()`). The three tables'
+keys are the Zeus `EntityId`. An entity takes the flag from the table of its
+own type (decision #16's single type), and only where that table has no row
+from another, highest type first. Each table's own flag is kept beside it,
+because 1,288 EntityIds are in more than one table. This is an annotation
+only: no parent, status or edge changes. Verified on the inputs of
+`zeus_hierarchy_2026_10_07_1529_loc1515`: every output file except
+`_hierarchy_nodes.csv` is byte-identical, and the nodes file differs only by
+the six new columns. `--no-migration` reproduces the earlier output exactly,
+and `--migration-from` replays a run exactly.
+
+| Entity type | Entities | Ready | Not ready | In no table |
+|---|---|---|---|---|
+| WorkLocation | 27,715 | 3,326 | 24,347 | 42 |
+| Client | 42,718 | 12,366 | 30,334 | 18 |
+| HealthSystem | 1,768 | 1,195 | 572 | 1 |
+| All | 72,201 | 16,887 | 55,253 | 61 |
+
+All 81 nodes whose tables disagree are health systems that also have a
+`client_summary` or `worklocation_summary` row.

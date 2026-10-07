@@ -55,6 +55,7 @@ Writes into "Results Output/zeus_hierarchy_<YYYY_MM_DD_HHMM>/":
 """
 import argparse
 import os
+import shutil
 import warnings
 from collections import defaultdict
 
@@ -62,8 +63,8 @@ import numpy as np
 import pandas as pd
 from openpyxl import Workbook
 
-from dhc_match_v2 import RESULTS_DIR, load_config, new_run_prefix, \
-    zeus_connect
+from dhc_match_v2 import RESULTS_DIR, _dbx_connect, load_config, \
+    new_run_prefix, zeus_connect
 from dhc_hierarchy import _xl, load_hierarchy, resolve_hierarchy_prefix, walk
 from build_audit_workbook import FILL_NAVY, FILL_PURPLE, H1, H2, SECTION, \
     WRAP, _put, _table, build_methodology, sheet_data, workbook_path
@@ -280,6 +281,102 @@ def load_zeus_links(zc, prefix, replay=None):
     for c in ('Link_Created', 'Last_Booked', 'History_Last_Begin'):
         links[c] = pd.to_datetime(links[c], errors='coerce')
     return out
+
+
+# The migration team's readiness tables (qat_gold.crmmig_rules), by the
+# hierarchy type each one describes. Each table's key is the Zeus EntityId.
+MIGRATION_TABLES = {'HealthSystem': 'healthsystem_summary',
+                    'Client': 'client_summary',
+                    'WorkLocation': 'worklocation_summary'}
+MIGRATION_FLAGS = {t: f'Ready_{t}_Summary' for t in MIGRATION_TABLES}
+MIGRATION_COLUMNS = (['Ready_For_Migration', 'Ready_For_Migration_From']
+                     + list(MIGRATION_FLAGS.values())
+                     + ['Ready_Tables_Disagree'])
+MIGRATION_SNAPSHOT = '_migration_readiness'
+
+
+def load_migration(cfg, prefix, replay=None):
+    """`migration.query_file` (one row per EntityId per readiness table),
+    queried live on the Databricks warehouse or replayed, always written to
+    this run's folder as <run>_migration_readiness.parquet, with the SQL that
+    produced it beside it as .sql, and read back from there."""
+    snap = f'{prefix}{MIGRATION_SNAPSHOT}'
+    if replay:
+        src = replay
+        if os.path.isdir(src):
+            tail = f'{MIGRATION_SNAPSHOT}.parquet'
+            hits = [f for f in os.listdir(src) if f.endswith(tail)]
+            if len(hits) != 1:
+                raise SystemExit(f'{src} holds {len(hits)} *{tail} files; '
+                                 f'pass the run prefix, or --no-migration.')
+            src = os.path.join(src, hits[0][:-len(tail)])
+        if not os.path.exists(f'{src}{MIGRATION_SNAPSHOT}.parquet'):
+            raise SystemExit(f'No {src}{MIGRATION_SNAPSHOT}.parquet; pass '
+                             f'--no-migration to replay a run without one.')
+        for ext in ('.parquet', '.sql'):
+            if os.path.exists(f'{src}{MIGRATION_SNAPSHOT}{ext}'):
+                shutil.copyfile(f'{src}{MIGRATION_SNAPSHOT}{ext}', snap + ext)
+        print(f'Migration   : replayed from {src}{MIGRATION_SNAPSHOT}.parquet')
+    else:
+        m = cfg.get('migration') or {}
+        if not m.get('query_file'):
+            raise SystemExit('No `migration: query_file:` in the config; pass '
+                             '--no-migration to build without readiness.')
+        q = open(m['query_file']).read()
+        with _dbx_connect(cfg.get('databricks') or {}) as cx, \
+                cx.cursor() as cur:
+            cur.execute(q)
+            df = cur.fetchall_arrow().to_pandas()
+        df.to_parquet(snap + '.parquet', index=False)
+        # newline='' so the copy is byte-identical to the .sql it came from.
+        with open(snap + '.sql', 'w', newline='') as f:
+            f.write(q)
+        print(f'Migration   : {len(df):,} rows ({m["query_file"]}) -> '
+              f'{snap}.parquet')
+    df = pd.read_parquet(snap + '.parquet')
+    need = {'EntityId', 'Migration_Table', 'Ready_For_Migration'}
+    if need - set(df.columns):
+        raise SystemExit(f'Migration readiness is missing '
+                         f'{sorted(need - set(df.columns))}; returned '
+                         f'{list(df.columns)}.')
+    df['EntityId'] = pd.to_numeric(df.EntityId).astype('Int64')
+    dup = df[df.duplicated(['EntityId', 'Migration_Table'], keep=False)]
+    if len(dup):
+        raise SystemExit(f'{dup.EntityId.nunique():,} EntityId(s) appear more '
+                         f'than once in one readiness table; each key is meant '
+                         f'to be unique within its table.')
+    return df
+
+
+def attach_migration(n, mig):
+    """Ready_For_Migration per node, from the readiness table of the node's
+    own type; where that table has no row, from another table, highest type
+    first, and Ready_For_Migration_From says which. Every table's own flag is
+    kept beside it (Ready_<Type>_Summary), since 1,288 EntityIds sit in more
+    than one table, and Ready_Tables_Disagree marks a node whose tables give
+    different flags."""
+    w = mig.pivot(index='EntityId', columns='Migration_Table',
+                  values='Ready_For_Migration')
+    n = n.copy()
+    for t, col in MIGRATION_FLAGS.items():
+        n[col] = (n.EntityId.map(w[t]) if t in w else pd.Series(
+            pd.NA, index=n.index)).astype('Int64')
+    ready, frm = [], []
+    for row in n[['Entity_Type'] + list(MIGRATION_FLAGS.values())] \
+            .itertuples(index=False):
+        flags = dict(zip(MIGRATION_FLAGS, row[1:]))
+        order = [row.Entity_Type] + [t for t in reversed(ROLES)
+                                     if t != row.Entity_Type]
+        hit = next((t for t in order if pd.notna(flags[t])), None)
+        ready.append(pd.NA if hit is None else flags[hit])
+        frm.append(None if hit is None else MIGRATION_TABLES[hit])
+    n['Ready_For_Migration'] = pd.array(ready, dtype='Int64')
+    n['Ready_For_Migration_From'] = frm
+    n['Ready_Tables_Disagree'] = n[list(MIGRATION_FLAGS.values())] \
+        .nunique(axis=1) > 1
+    lead = NODE_COLUMNS[:NODE_COLUMNS.index('In_Scope') + 1]
+    return n[lead + MIGRATION_COLUMNS
+             + [c for c in NODE_COLUMNS if c not in lead]]
 
 
 # ============================================================================
@@ -842,6 +939,11 @@ def checks(counts, ent, n, edges):
              zip(edges.Entity_Type, edges.Parent_Type)), len(edges)),
         ('nodes in a cycle = 0', int((n.Tree_Issue == 'Cycle').sum()), 0),
     ]
+    if 'Ready_For_Migration' in n:
+        r = n.Ready_For_Migration
+        rows.append(('ready + not ready + in no readiness table = nodes',
+                     int((r == 1).sum() + (r == 0).sum() + r.isna().sum()),
+                     len(n)))
     return rows
 
 
@@ -943,6 +1045,23 @@ def build_workbook(path, run, n, contra, repl, dropped, n_self, pniz, remaps,
     r = _table(ws, r + 1, ['Health system', 'EntityId', 'Work locations'],
                [[x.Top_HealthSystem_Name, int(x.Top_HealthSystem_EntityId),
                  int(x.WLs)] for x in tops.itertuples(index=False)])
+    if 'Ready_For_Migration' in n:
+        _put(ws, f'B{r}', 'Migration readiness (qat_gold.crmmig_rules)',
+             SECTION)
+        rows = []
+        for t in ROLES[::-1] + ['All']:
+            s = n if t == 'All' else n[n.Entity_Type == t]
+            own = s.Entity_Type.map(MIGRATION_TABLES)
+            rows.append([t, len(s), int((s.Ready_For_Migration == 1).sum()),
+                         int((s.Ready_For_Migration == 0).sum()),
+                         int(s.Ready_For_Migration.isna().sum()),
+                         int((s.Ready_For_Migration_From.notna()
+                              & (s.Ready_For_Migration_From != own)).sum()),
+                         int(s.Ready_Tables_Disagree.sum())])
+        r = _table(ws, r + 1, ['Entity type', 'Entities', 'Ready (1)',
+                               'Not ready (0)', 'In no table',
+                               "From another type's table",
+                               'Tables disagree'], rows)
     _put(ws, f'B{r}', 'Inputs', SECTION)
     r = _table(ws, r + 1, ['Input', 'Value'],
                [[k, v] for k, v in inputs] +
@@ -951,7 +1070,8 @@ def build_workbook(path, run, n, contra, repl, dropped, n_self, pniz, remaps,
     _table(ws, r + 1, ['Check', 'Left', 'Right', 'Result'],
            [[k, a, b, 'OK' if a == b else 'FAIL'] for k, a, b in check_rows])
 
-    build_methodology(wb, METHODOLOGY)
+    build_methodology(wb, METHODOLOGY + (
+        MIGRATION_METHODOLOGY if 'Ready_For_Migration' in n else []))
     sheet_data(wb, 'Hierarchy', _xl(n))
     sheet_data(wb, 'Contradictions', _xl(contra))
     sheet_data(wb, 'Zeus_Links_Replaced', _xl(repl))
@@ -1080,6 +1200,26 @@ METHODOLOGY = [
 ]
 
 
+MIGRATION_METHODOLOGY = [
+    ('Ready_For_Migration', 'The migration team\'s ready_for_migration flag '
+                            '(1 ready, 0 not) from qat_gold.crmmig_rules: '
+                            'healthsystem_summary, client_summary and '
+                            'worklocation_summary, keyed HealthSystemInfoId, '
+                            'ClientInfoId and WorkLocationInfoId, each the '
+                            'Zeus EntityId. An entity takes the flag from the '
+                            'table of its own Entity_Type; where that table '
+                            'has no row, from another table, highest type '
+                            'first, and Ready_For_Migration_From names the '
+                            'table used. Blank: the entity is in none of the '
+                            'three. Some EntityIds are in more than one table, '
+                            'so each table\'s own flag is shown as '
+                            'Ready_<Type>_Summary, and Ready_Tables_Disagree '
+                            'marks those whose tables differ. Snapshotted per '
+                            'run as _migration_readiness.parquet; '
+                            '--migration-from replays it.'),
+]
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -1101,6 +1241,13 @@ def main():
                     help='replay the Zeus link snapshots of an earlier '
                          'zeus_hierarchy run (folder or prefix); default: '
                          'query Zeus live')
+    ap.add_argument('--migration-from', metavar='RUN',
+                    help='replay the migration readiness snapshot of an '
+                         'earlier zeus_hierarchy run (folder or prefix); '
+                         'default: query qat_gold.crmmig_rules live')
+    ap.add_argument('--no-migration', action='store_true',
+                    help='leave the migration readiness columns out (the '
+                         'pre-2026-10-07 output)')
     ap.add_argument('--label', help='optional suffix for the run folder name')
     ap.add_argument('--results-dir', default=RESULTS_DIR)
     a = ap.parse_args()
@@ -1135,6 +1282,10 @@ def main():
     cut = break_loops(recs, name, E.In_Scope.to_dict())
     top_and_path(recs, name, etype)
     n = node_frame(recs, ent, D)
+    mig = None
+    if not a.no_migration:
+        mig = load_migration(cfg, prefix, a.migration_from)
+        n = attach_migration(n, mig)
     edges = n[n.Parent_EntityId.notna()][EDGE_COLUMNS]
     contra = pd.DataFrame(contra)
     if len(contra):
@@ -1196,6 +1347,14 @@ def main():
     print(f'  resolved ids in the Definitive hierarchy: '
           f'{int(rids.isin(D.known).sum()):,} of {len(rids):,} (the rest are '
           f'GPOs, practice-location parents or ids Definitive has dropped)')
+    if mig is not None:
+        r = n.Ready_For_Migration
+        print(f'Migration   : {int((r == 1).sum()):,} ready, '
+              f'{int((r == 0).sum()):,} not ready, {int(r.isna().sum()):,} in '
+              f'no readiness table; '
+              f'{int((n.Ready_For_Migration_From.notna() & (n.Ready_For_Migration_From != n.Entity_Type.map(MIGRATION_TABLES))).sum()):,} '
+              f'from another type\'s table; '
+              f'{int(n.Ready_Tables_Disagree.sum()):,} whose tables disagree')
     rows = checks(counts, ent, n, edges)
     print_checks(rows)
     print(f'Wrote {prefix}_hierarchy_nodes.csv  (+ _edges, _contradictions, '
@@ -1206,6 +1365,9 @@ def main():
               ('Coverage run', os.path.basename(a.coverage)),
               ('Definitive hierarchy', src or 'queried live'),
               ('Zeus links', a.zeus_links or 'queried live')]
+    if mig is not None:
+        inputs.append(('Migration readiness',
+                       a.migration_from or 'queried live'))
     build_workbook(wbp, os.path.basename(prefix), n, contra, repl, dropped,
                    n_self, pniz, remaps, ent, counts, rows, inputs)
     print(f'Wrote {wbp}')
