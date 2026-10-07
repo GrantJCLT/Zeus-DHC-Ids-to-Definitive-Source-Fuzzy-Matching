@@ -116,6 +116,9 @@ zeus:
   hierarchy_query_file: Zeus hierarchy links.sql
   linked_import_query_file: Zeus linked import entities.sql
   duplicates_query_file: Zeus entity duplicates.sql
+  # Every active Definitive-import-created entity with a Definitive id, linked
+  # or not (dhc_only_hierarchy.py only). No link table is read.
+  import_query_file: Zeus import entities.sql
 
   key: EntityId                     # one scored row per EntityId after pooling
   # Tried in order; the first non-null wins. Where both are populated and

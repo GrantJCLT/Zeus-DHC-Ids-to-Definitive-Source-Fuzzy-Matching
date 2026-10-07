@@ -104,6 +104,31 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   16,887 ready, 55,253 not, 61 in no table (all but one in scope), 18 from
   another type's table, 81 health systems whose tables disagree. Nothing else
   in the outputs changes.
+- `dhc_only_hierarchy.py` — the Definitive-only hierarchy of the ids Zeus
+  holds, added 2026-10-07 at Grant's request: "use Definitive ids in Zeus as
+  a base; do not use any Zeus hierarchy". The base is the accuracy run's
+  `_scored` + `_unverifiable` (every entity with an id, the id as Zeus stores
+  it, any verdict) plus, since the same day, **every active
+  Definitive-import-created entity with a Definitive id**, linked or not
+  (`Zeus import entities.sql`, `zeus.import_query_file`; snapshotted as
+  `_zeus_imports.csv`, replayed with `--zeus-imports`, left out with
+  `--no-imports`). `Base_Source` says which. Each id is walked up with
+  `dhc_hierarchy.walk()`, and no Zeus link, role, correction or coverage
+  proposal is read. Unplaced ids are classed (`Id_Status`) against the
+  accuracy run's own Definitive snapshots. Writes
+  `_entities.csv` (per Zeus entity, with the Zeus EntityIds holding its
+  immediate and ultimate parent's id), `_hierarchy.csv` (base records plus
+  every owner above them; owners in no view get a root row) and the two edge
+  lists, plus `Definitive_Only_Hierarchy_<run>.xlsx`. Eight identity checks; a
+  replay from its own folder is byte-identical (verified 2026-10-07). Run
+  `dhc_only_hierarchy_2026_10_07_1811_imports`: 215,826 entities (12,803
+  audited + 203,023 import-created), 112,218 placed, 110,574 records (2,501
+  owners only) in 97,612 trees, 16,077 entities with an owner. Audited-only
+  (`_1800`): 11,085 of 12,803 placed. **101,727 import-created ids are in no
+  Definitive source** - 98,320 of them physician group imports, mostly 6-7
+  digit ids absent from today's `physiciangroupsoverview` (the queries do
+  not filter rows), so Definitive has presumably retired them since import;
+  not yet confirmed. Not in `run_all.py`.
 - `Hierarchy_Logic.md` — reference for the Zeus hierarchy, written
   2026-10-07: nodes, universe, resolution bases, the Definitive parent walk,
   every `Zeus_Link_Status`, the Zeus tie-break, duplicates, measured results,
@@ -581,9 +606,9 @@ The folder is a git repo with a **private** GitHub remote,
 `GrantJCLT/Zeus-DHC-Ids-to-Definitive-Source-Fuzzy-Matching`. Keep it private:
 the history contains licensed Definitive exports and Zeus client records.
 
-Only source is tracked — the four scripts plus `run_all.py`, `dhc_hierarchy.py` and `zeus_hierarchy.py`, `sources.yaml`,
-the twenty-three `.sql` files (twelve Zeus population queries, the Zeus phone
-query, the three Zeus hierarchy queries, four Definitive sources, the hospital
+Only source is tracked — the four scripts plus `run_all.py`, `dhc_hierarchy.py`, `dhc_only_hierarchy.py` and `zeus_hierarchy.py`, `sources.yaml`,
+the twenty-four `.sql` files (twelve Zeus population queries, the Zeus phone
+query, the three Zeus hierarchy queries, the Zeus import entities query, four Definitive sources, the hospital
 and physician-group hierarchies, the migration readiness query), this file, `Usage.md`, `Environment.md`,
 `Matching_Logic.md`, `Hierarchy_Logic.md`, the business overview, and `.gitignore`. Everything else is deliberately ignored:
 

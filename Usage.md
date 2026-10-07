@@ -13,6 +13,7 @@ normalised and scored, see [Matching_Logic.md](Matching_Logic.md).
 | **Accuracy**: of the Zeus entities that carry a DHC ID, how many point at the right Definitive record? | `dhc_match_v2.py run` | `Zeus_DHC_ID_Accuracy_Audit_<date>_<time>.xlsx` | 2–3 min |
 | **Coverage**: which Zeus entities carry no DHC ID, and which Definitive record should each one point at? | `dhc_gap_match.py` | `Zeus_DHC_ID_Coverage_Audit_<date>_<time>.xlsx` | 20–30 min |
 | **Definitive hierarchy**: how Definitive's hospitals, health systems, physician groups and their practice locations nest under their owners | `dhc_hierarchy.py` | `Definitive_Ownership_Hierarchy_<date>_<time>.xlsx` plus `<run>_hierarchy.csv` | about 6 min (1.5 with `--no-locations`) |
+| **Definitive-only hierarchy of Zeus ids**: the Definitive ids Zeus holds, each walked up Definitive's own ownership chain, with no Zeus link used | `dhc_only_hierarchy.py` | `Definitive_Only_Hierarchy_<date>_<time>.xlsx` plus `<run>_entities.csv` | about 3 min (under 1 with `--no-imports`), once an accuracy run exists |
 | **Zeus hierarchy**: one Health System > Client > Work Location tree for Zeus, from Definitive ownership first and Zeus links second; a read-only baseline to validate the migration team's hierarchy against | `zeus_hierarchy.py` | `Zeus_Entity_Hierarchy_<date>_<time>.xlsx` plus `<run>_hierarchy_edges.csv` | about 1 min, once both audits exist |
 | **Optional extra:** the same answers limited to one Zeus population, e.g. Work Locations for the third-party data-cleaning group. **An extra workbook alongside the full one, never instead of it** | the same runs, plus a build with `--population WorkLocation` | `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<date>_<time>.xlsx` and `..._Coverage_Audit_WorkLocation_...` | seconds, once the runs exist |
 
@@ -595,6 +596,63 @@ neither view (The US Oncology Network, AMSURG, RadNet, Village Medical, ...);
 they are kept, named from `SfParentAccountName`, and flagged. 95.7% of
 physician groups have no parent at all. A `FAIL` or a jump in the issue count
 means a view changed shape. Look before you circulate.
+
+### Definitive-only hierarchy of the ids Zeus holds
+
+The base is every Zeus entity with a Definitive id, using the id exactly as
+Zeus stores it, whatever its verdict. That covers two groups:
+
+- the audited entities: the accuracy run's `_scored.csv` and
+  `_unverifiable.csv` together;
+- every active entity created by a Definitive import that holds a Definitive
+  id, whether it is linked or not. These come from `Zeus import entities.sql`,
+  which is queried live on the ReadOnly replica. The audits exclude these
+  entities, so their `Verdict` is `Import-created (not audited)`.
+
+Each id is walked up Definitive's ownership chain by the same parent rule as
+above. No Zeus link, Zeus role, correction or coverage proposal is used:
+
+```
+py dhc_only_hierarchy.py --config sources.yaml \
+    --accuracy "Results Output/<accuracy run>/<accuracy run>_scored.csv" \
+    [--definitive-from "Results Output/<dhc_hierarchy run>"] \
+    [--zeus-imports "Results Output/<earlier dhc_only_hierarchy run>"] \
+    [--no-imports]
+```
+
+`--zeus-imports` replays the `_zeus_imports.csv` snapshot instead of querying
+Zeus. `--no-imports` leaves the import-created entities out. The run takes
+about 3 minutes with the import-created entities and under 1 minute without.
+Check for `connected to a READ_ONLY database` in the output, as for the audits.
+
+The run writes these files into `Results Output/dhc_only_hierarchy_<date>_<time>/`:
+
+- `<run>_entities.csv`: one row per Zeus entity, with its id's `Id_Status`, its immediate and
+  ultimate Definitive parent, and `Immediate_Parent_Zeus_EntityIds` /
+  `Ultimate_Parent_Zeus_EntityIds`, the Zeus entities whose own id is that
+  parent.
+- `<run>_hierarchy.csv`: one row per Definitive record in the tree. That is
+  each record a Zeus entity points at (`Node_Role = Zeus id`) plus every owner
+  above it (`Owner only`). An owner that is in no view gets its own root row.
+- The `_immediate` / `_ultimate` edge lists, the snapshots, and the workbook.
+
+Eight identity checks print as `OK`/`FAIL`. A replay from the run's own folder
+is byte-identical.
+
+Measured on `dhc_only_hierarchy_2026_10_07_1811_imports` (accuracy run
+`0834`, hierarchy snapshot `1515`):
+
+- **Base:** 215,826 entities, of which 12,803 are audited and 203,023
+  import-created. 112,218 are placed in the tree.
+- **Not placed:** 103,433 have an id in no Definitive source (1,706 audited
+  and 101,727 import-created), 170 hold a practice-location parent id, and 5
+  hold a GPO id.
+- **Tree:** 110,574 records in 97,612 trees, depth ≤ 3. 16,077 entities have
+  an owner above them.
+
+**Most import-created physician group ids are no longer in Definitive's
+views.** That accounts for 98,320 of the 101,727 unplaced import-created
+ids, so expect this figure rather than treating it as a wiring fault.
 
 ---
 
