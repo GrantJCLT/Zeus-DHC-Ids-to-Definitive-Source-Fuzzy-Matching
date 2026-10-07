@@ -107,6 +107,16 @@ zeus:
   # and address (Phone_Match); they never change Verdict or Match_Tier.
   phone_query_file: Zeus entity phones.sql
 
+  # The HealthSystem > Client > WorkLocation hierarchy (zeus_hierarchy.py only;
+  # the audits never read these). The links query is every active
+  # WorkLocation -> Client and Client -> HealthSystem link; the import query is
+  # every Definitive-import-created entity on either end of one, since those
+  # become hierarchy nodes wherever an in-scope entity links to them; the
+  # duplicates query is every entity marked DuplicateOfId another.
+  hierarchy_query_file: Zeus hierarchy links.sql
+  linked_import_query_file: Zeus linked import entities.sql
+  duplicates_query_file: Zeus entity duplicates.sql
+
   key: EntityId                     # one scored row per EntityId after pooling
   # Tried in order; the first non-null wins. Where both are populated and
   # disagree the row is flagged in DHC_Id_Conflict. Both live on dbo.Entity /
@@ -206,15 +216,24 @@ locations:
     phone: Phones                     # '|'-joined, see the query
 
 # ---------------------------------------------------------------------------
-# HIERARCHY source: read by dhc_hierarchy.py only, never by the two audits.
+# HIERARCHY sources: read by dhc_hierarchy.py only, never by the two audits.
 #
-# Hospital Overview only, by rule (2026-09-30). The parent rule -
-# SfParentAccountId, else IdNetwork, else HospitalId (a root) - lives in the
-# query, which emits ParentId and Parent_Rule. Snapshotted per run like the
-# blocks above.
+# One block per Definitive view, unioned into one tree. Hospital Overview was
+# the only source by rule from 2026-09-30; physician groups were added on
+# 2026-10-07 for the Zeus HealthSystem > Client > WorkLocation hierarchy
+# (zeus_hierarchy.py), which needs a parent for every id a Zeus entity can
+# resolve to. Every query emits the same columns, and the same parent rule -
+# SfParentAccountId, else IdNetwork, else HospitalId (a root) - lives in each
+# query as ParentId and Parent_Rule. Ids do not overlap between the views; a
+# run stops if they ever do. Snapshotted per run like the blocks above.
 # ---------------------------------------------------------------------------
 hierarchy:
-  query_file: Definitive Hospital Hierarchy.sql
-  snapshot: hospitalhierarchy         # <run>_dhc_hospitalhierarchy.parquet
-  id: HospitalId
-  name: HospitalName
+  - query_file: Definitive Hospital Hierarchy.sql
+    snapshot: hospitalhierarchy       # <run>_dhc_hospitalhierarchy.parquet
+    id: HospitalId
+    name: HospitalName
+
+  - query_file: Definitive Physician Group Hierarchy.sql
+    snapshot: physiciangrouphierarchy # <run>_dhc_physiciangrouphierarchy.parquet
+    id: HospitalId
+    name: HospitalName

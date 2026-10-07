@@ -12,7 +12,8 @@ normalised and scored, see [Matching_Logic.md](Matching_Logic.md).
 |---|---|---|---|
 | **Accuracy**: of the Zeus entities that carry a DHC ID, how many point at the right Definitive record? | `dhc_match_v2.py run` | `Zeus_DHC_ID_Accuracy_Audit_<date>_<time>.xlsx` | 2–3 min |
 | **Coverage**: which Zeus entities carry no DHC ID, and which Definitive record should each one point at? | `dhc_gap_match.py` | `Zeus_DHC_ID_Coverage_Audit_<date>_<time>.xlsx` | 20–30 min |
-| **Hierarchy**: how Definitive's hospitals and health systems nest under their owners, for comparison with the migration team's destination data | `dhc_hierarchy.py` | `Definitive_Hospital_Hierarchy_<date>_<time>.xlsx` plus `<run>_hierarchy.csv` | under 1 min |
+| **Definitive hierarchy**: how Definitive's hospitals, health systems and physician groups nest under their owners | `dhc_hierarchy.py` | `Definitive_Ownership_Hierarchy_<date>_<time>.xlsx` plus `<run>_hierarchy.csv` | about 1.5 min |
+| **Zeus hierarchy**: one Health System > Client > Work Location tree for Zeus, from Definitive ownership first and Zeus links second; a read-only baseline to validate the migration team's hierarchy against | `zeus_hierarchy.py` | `Zeus_Entity_Hierarchy_<date>_<time>.xlsx` plus `<run>_hierarchy_edges.csv` | about 1 min, once both audits exist |
 | **Optional extra:** the same answers limited to one Zeus population, e.g. Work Locations for the third-party data-cleaning group. **An extra workbook alongside the full one, never instead of it** | the same runs, plus a build with `--population WorkLocation` | `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<date>_<time>.xlsx` and `..._Coverage_Audit_WorkLocation_...` | seconds, once the runs exist |
 
 Each question takes two steps: a **run**, which reads Zeus and Definitive and
@@ -49,14 +50,18 @@ py run_all.py
 ```
 
 That one command is the full refresh: **both audits, over all six Zeus
-populations, and both full workbooks**. About 30 minutes. It runs:
+populations, both full workbooks, and both hierarchies**. About 35 minutes. It
+runs:
 
 1. the accuracy run;
 2. the coverage run, cross-checked against step 1 (`--claimed`) and scored
    against **step 1's Definitive snapshots** (`--definitive-from`), so both
    audits see exactly the same Definitive data even though the views refresh in
    place;
-3. the full accuracy workbook and the full coverage workbook.
+3. the full accuracy workbook and the full coverage workbook;
+4. the Definitive ownership hierarchy (section 3);
+5. the Zeus Health System > Client > Work Location hierarchy (section 4), from
+   steps 1, 2 and 4.
 
 ### Add the Work Location workbooks as well
 
@@ -77,10 +82,10 @@ What each form writes:
 
 | Command | Workbooks written |
 |---|---|
-| `py run_all.py` | 2: `Zeus_DHC_ID_Accuracy_Audit_<run>.xlsx`, `Zeus_DHC_ID_Coverage_Audit_<run>.xlsx`, covering all populations |
-| `py run_all.py --population WorkLocation` | 4: the same 2, **plus** `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<run>.xlsx` and `Zeus_DHC_ID_Coverage_Audit_WorkLocation_<run>.xlsx` |
-| `py run_all.py --population WorkLocation --population Client` | 6: the same 2, plus 2 for Work Location, plus 2 for Client |
-| `py run_all.py --population all` | 14: the same 2, plus 2 for each of the six labels under `zeus.sources` in the config |
+| `py run_all.py` | 4: `Zeus_DHC_ID_Accuracy_Audit_<run>.xlsx`, `Zeus_DHC_ID_Coverage_Audit_<run>.xlsx`, covering all populations, plus the two hierarchy workbooks |
+| `py run_all.py --population WorkLocation` | 6: the same 4, **plus** `Zeus_DHC_ID_Accuracy_Audit_WorkLocation_<run>.xlsx` and `Zeus_DHC_ID_Coverage_Audit_WorkLocation_<run>.xlsx` |
+| `py run_all.py --population WorkLocation --population Client` | 8: the same 4, plus 2 for Work Location, plus 2 for Client |
+| `py run_all.py --population all` | 16: the same 4, plus 2 for each of the six labels under `zeus.sources` in the config |
 
 The run time is the same either way; each extra pair of workbooks takes under a
 minute. For the labels you can use and what each contains, see
@@ -117,8 +122,9 @@ the command exits with code 1.
 |---|---|
 | `--population <label>` | **Adds** workbooks limited to that population, beside the full ones; repeatable. `all` means every `zeus.sources` label in the config. Never changes what is run or scored. See [`--population` labels](#--population-labels) |
 | `--label <x>` | Suffix for both run folders |
-| `--accuracy-only` | Just the accuracy run and its workbook(s), about 3 minutes |
-| `--limit N` | Coverage scores only the first N entities: a 4-minute end-to-end test. The "extract entities = population" check shows `n/a` then, as expected |
+| `--accuracy-only` | Just the accuracy run and its workbook(s), about 3 minutes. Skips both hierarchies, which need the coverage run |
+| `--no-hierarchy` | Skips the two hierarchy steps |
+| `--limit N` | Coverage scores only the first N entities: a 6-minute end-to-end test. The "extract entities = population" check shows `n/a` then, as expected; the Zeus hierarchy is built over that smaller universe |
 | `--no-reverse` | Accuracy run skips the reverse lookup |
 | `--config <file>` | Default `sources.yaml` |
 
@@ -502,35 +508,38 @@ Treat `True` as strong supporting evidence and `False` as a reason to look
 closer. On confirmed accuracy rows the phones agree about 92% of the time, so
 some disagreement is normal: numbers change.
 
-## 3. Hospital ownership hierarchy
+## 3. Definitive ownership hierarchy
 
-One command. It reads Definitive Hospital Overview only (hospitals and health
-systems), gives every record one parent, and walks each chain up to its root:
+One command. It reads every view under `hierarchy:` in `sources.yaml`:
+Definitive Hospital Overview (hospitals and health systems) and, since
+2026-10-07, Physician Group Overview. It gives every record one parent, and
+walks each chain up to its root:
 
 ```
 py dhc_hierarchy.py --config sources.yaml     --accuracy "Results Output/<accuracy run>/<accuracy run>_scored.csv"
 ```
 
 The parent rule is `SfParentAccountId`, else `IdNetwork`, else the record's own
-`HospitalId`, which makes it a root. The rule is written in
-`Definitive Hospital Hierarchy.sql` and nowhere else, and the `Parent_Rule`
-column says which step decided each row. `--accuracy` is optional: it adds the
-Zeus EntityIds that carry each Definitive id (`Zeus_EntityIds`,
-`Tree_Zeus_Entity_Count`), so the destination data can be compared on either
-key. `--definitive-from <hierarchy run folder>` replays that run's snapshot,
-and the output is byte-identical.
+`HospitalId`, which makes it a root. Each view's rule is written in its own
+`Definitive * Hierarchy.sql` and nowhere else, and the `Parent_Rule` column
+says which step decided each row; `Source_View` says which view the record came
+from. `--accuracy` is optional: it adds the Zeus EntityIds that carry each
+Definitive id (`Zeus_EntityIds`, `Tree_Zeus_Entity_Count`), so the destination
+data can be compared on either key. `--definitive-from <hierarchy run folder>`
+replays that run's snapshots, and the output is byte-identical. A run from
+before 2026-10-07 has no physician-group snapshot and cannot be replayed.
 
-Every record gets **two parents, labelled**, because the tree runs up to three
-levels deep (system > division or region > hospital), and the destination
-system may model either grain:
+Every record gets **two parents, labelled**, because the tree runs up to four
+levels deep (system > division or region > hospital > physician group), and the
+destination system may model either grain:
 
 | Prefix | Meaning | Example for Medical City Denton |
 |---|---|---|
-| `Immediate_Parent*` | The direct owner, in the full tree. `Immediate_Level` is 0 for a root and up to 2 below it | HCA Medical City Healthcare (North Texas Division) |
+| `Immediate_Parent*` | The direct owner, in the full tree. `Immediate_Level` is 0 for a root and up to 3 below it | HCA Medical City Healthcare (North Texas Division) |
 | `Ultimate_Parent*` | The top-level owner, with the tree flattened to two levels. `Ultimate_Level` is 0 or 1 | HCA Healthcare |
 
-They differ only for the 2,247 records with `Has_Intermediate_Parent = True`.
-A root is its own immediate and ultimate parent.
+They differ only for records with `Has_Intermediate_Parent = True`. A root is
+its own immediate and ultimate parent.
 
 Written to `Results Output/dhc_hierarchy_<date>_<time>/`:
 
@@ -544,18 +553,119 @@ Written to `Results Output/dhc_hierarchy_<date>_<time>/`:
   `Immediate_Child_Count`, `Descendant_Count`, `Hierarchy_Issue`, and the Zeus
   columns. Hand the migration team the edge list that matches their grain, or
   this file if they want both.
-- `<run>_dhc_hospitalhierarchy.parquet` / `.sql`: the snapshot and the SQL
-  that produced it.
-- `Definitive_Hospital_Hierarchy_<date>_<time>.xlsx`: Summary (records by
-  level, immediate versus ultimate, by rule, largest ultimate parents,
-  identity checks), Methodology, Immediate_Parent, Ultimate_Parent,
-  Hierarchy, Roots, Hierarchy_Issues, and Zeus_Linked if `--accuracy` was
-  given.
+- `<run>_dhc_hospitalhierarchy.parquet` / `.sql` and
+  `<run>_dhc_physiciangrouphierarchy.parquet` / `.sql`: the snapshots and the
+  SQL that produced them.
+- `Definitive_Ownership_Hierarchy_<date>_<time>.xlsx`: Summary (records by
+  level and type, immediate versus ultimate, by rule, largest ultimate
+  parents, identity checks), Methodology, Immediate_Parent, Ultimate_Parent,
+  Hierarchy, Roots (those that own something), Hierarchy_Issues, and
+  Zeus_Linked if `--accuracy` was given.
 
-What you should see (2026-09-30): 9,887 records, 2,589 trees (683 with more
-than one member), maximum depth 2, two `Parent_Not_In_Definitive` rows, and
-four `OK` checks. A `FAIL` or a jump in the issue count means the view changed
-shape. Look before you circulate.
+What you should see (2026-10-07): 153,508 records (8,710 hospitals, 1,181
+health systems, 142,819 physician groups, 467 MSOs, 331 IPAs), 142,595 trees
+(1,566 with more than one member), maximum depth 3, 2,768
+`Parent_Not_In_Definitive` rows, and four checks ending `OK`. Almost all of
+those 2,768 are physician groups owned by a corporate parent that is in
+neither view (The US Oncology Network, AMSURG, RadNet, Village Medical, ...);
+they are kept, named from `SfParentAccountName`, and flagged. 95.7% of
+physician groups have no parent at all. A `FAIL` or a jump in the issue count
+means a view changed shape. Look before you circulate.
+
+---
+
+## 4. Zeus entity hierarchy (Health System > Client > Work Location)
+
+A **read-only comparison baseline**: the migration team derives the hierarchy
+that will be used, and this one exists to validate theirs. Nothing is written
+back to Zeus or any other source; the workbook is the deliverable.
+
+One command, once an accuracy run, a coverage run and a Definitive hierarchy
+run exist (`run_all.py` does all four in order):
+
+```
+py zeus_hierarchy.py --config sources.yaml `
+    --accuracy "Results Output/<accuracy run>/<accuracy run>_scored.csv" `
+    --coverage "Results Output/<coverage run>/<coverage run>_gap_candidates.csv" `
+    --definitive-hierarchy "Results Output/<dhc_hierarchy run>"
+```
+
+Every entity gets **one type** - the highest of its Zeus roles, HealthSystem
+over Client over WorkLocation, so a hospital Zeus flags as client and work
+location is a Client - and **one parent or none**. A parent is always a higher
+type, or a health system under a health system to any depth: a work location
+sits under a client or a health system, a client under a health system.
+Definitive ownership comes first and Zeus links complete it. The rules are in
+[Hierarchy_Logic.md](Hierarchy_Logic.md). In short:
+
+- Each entity's Definitive id comes from the audits: supplied ids rated
+  `ID corroborated` or `Probable` (no `Geo_Conflict`), recommended
+  corrections, and `Strong match` coverage proposals. Definitive-import-created
+  entities that Zeus links to in-scope ones are included too, with the id they
+  were created from.
+- The Definitive parent is the nearest record up the entity's Definitive
+  ownership chain that a Zeus entity of an allowed parent type stands for.
+- **Definitive wins** where it knows an owner, and **hospital owners outrank
+  staffing firms**. Where Zeus names a *different hospital or health system*
+  (or, above work locations, any parent in a different Definitive tree), that
+  is a `Contradiction`: the Zeus link is **kept for now** and listed for
+  review. A Zeus entity on the *same* Definitive record confirms or fills, but
+  never overrides a Zeus link.
+- Otherwise the Zeus link stands. With several, the tie-break is the child's
+  own Definitive tree, then bookings, then link history.
+- Zeus links that one type per entity cannot hold - a hospital linked to
+  itself, a client under a client - are set aside, and two health systems
+  linked to each other are separated (`Loops_Broken`).
+
+The column to act on is `Zeus_Link_Status`:
+
+| Status | Meaning |
+|---|---|
+| `Agrees` | Definitive's parent is one Zeus already links |
+| `Definitive fills` | Zeus had no link; Definitive supplied one |
+| `Definitive replaces` | Zeus linked a parent in the same Definitive tree, one with no trusted Definitive id, or - for a work location - only staffing firms or physician groups where Definitive names a hospital or health system owner. Definitive's owner is used. Sheet `Zeus_Links_Replaced` lists each overridden link and why |
+| `Contradiction` | Every Zeus parent is in a different Definitive tree, and it is not the staffing-firm case. **Held**: the Zeus link is kept until reviewed. Sheet `Contradictions` |
+| `Zeus only` | Definitive has no parent for it; the Zeus link is used |
+| `No parent` | Neither source has one, or a loop was broken here (`Tree_Issue` says so). Expected for a client with no health system; an orphan for a work location |
+
+`--zeus-links <run folder>` and `--definitive-hierarchy <run folder>` both
+accept an earlier `zeus_hierarchy` run, and with the same audit files the
+output is byte-identical. Without `--zeus-links` the three Zeus queries
+(`Zeus hierarchy links.sql`, `Zeus linked import entities.sql`,
+`Zeus entity duplicates.sql`) run live, in seconds.
+
+Written to `Results Output/zeus_hierarchy_<date>_<time>/`:
+
+- `<run>_hierarchy_edges.csv`: **the tree**, one row per child: child and
+  its `Entity_Type`, parent and its type, `Zeus_Link_Status`, both ends'
+  `Resolution_Basis`.
+- `<run>_hierarchy_nodes.csv`: one row per entity, everything: `Entity_Type`
+  and the `Zeus_Roles` behind it, its resolved id, the chosen parent and why,
+  `Definitive_Distance` (0 same record, 1 direct owner, 2+ higher), the
+  Definitive records climbed past, every Zeus link with the reason one was
+  chosen, the held Definitive parent for a contradiction, `Top_HealthSystem_*`,
+  `Path_Names` and `Tree_Issue`.
+- `<run>_contradictions.csv`, `<run>_zeus_links_replaced.csv`,
+  `<run>_zeus_links_dropped.csv`: the review lists.
+- `<run>_resolution.csv`: the Definitive id (or none) and type of every
+  in-scope entity and every import-created one in the tree, with
+  `In_Definitive_Hierarchy`.
+- `<run>_zeus_links.csv`, `_zeus_linked_imports.csv`, `_zeus_duplicates.csv`
+  and `<run>_dhc_*hierarchy.parquet`: the inputs, for replay. **Keep them with
+  anything you circulate.**
+- `Zeus_Entity_Hierarchy_<date>_<time>.xlsx`: Summary, Methodology,
+  Hierarchy, Contradictions, Zeus_Links_Replaced, Zeus_Links_Dropped,
+  Loops_Broken, Multi_Parent_Choices, Definitive_Parents_Not_In_Zeus,
+  Shared_Definitive_Id, Orphans, Duplicates_Remapped.
+
+What you should see (2026-10-07, the first full run's inputs): 72,201 entities
+(27,715 work locations, 42,718 clients, 1,768 health systems; 11,688
+import-created), the `connected to a READ_ONLY database` line on a live run,
+nine checks ending `OK`, 8 health system loops broken, and at the work location
+level 2,844 `Agrees`, 2,228 `Definitive replaces`, 110 `Contradiction` and
+22,247 `Zeus only`. A large swing in `Definitive replaces` or `Contradiction`,
+or more than a handful of loops, means the audits, Zeus or Definitive moved;
+look before you circulate.
 
 ---
 
@@ -610,7 +720,9 @@ and the `_dhc_*.parquet` snapshots, a figure can't be reproduced later, because
 both Zeus and the Definitive views change in place.
 
 A coverage proposal list is only valid against the Definitive snapshot it came
-from. Rerun it before loading an old one.
+from. Rerun it before loading an old one. The same holds for a Zeus hierarchy:
+it rests on both audits and on that day's Zeus links, so archive its folder
+with the two audit folders it was built from.
 
 After a new run, update the hand-copied figures in
 `Zeus_DHC_ID_Audit_Business_Overview.md` and the Results sections of
@@ -628,5 +740,6 @@ After a new run, update the hand-copied figures in
 | `... is missing [column]` naming a Zeus or Definitive column | A query or view renamed a column | Fix the `.sql` alias or the role mapping in `sources.yaml` |
 | Builder stops: snapshot missing | The run folder has no `_dhc_*.parquet` (pre-2026-09-29, or files moved) | Build with a config that points at the xlsx exports, or rerun |
 | `PermissionError` writing the `.xlsx` | The workbook is open in Excel | Close it and rebuild |
-| VS Code marks the `Definitive *.sql` files full of errors (`Invalid object name 'prd_silver...'`, `'array_sort' is not a recognized built-in function`) | The editor checks every `.sql` file as SQL Server. These four are Databricks SQL | False alarm. To check one, run it in the Databricks SQL editor |
+| VS Code marks the `Definitive *.sql` files full of errors (`Invalid object name 'prd_silver...'`, `'array_sort' is not a recognized built-in function`, `Incorrect syntax near '`'`) | The editor checks every `.sql` file as SQL Server. These six are Databricks SQL | False alarm. To check one, run it in the Databricks SQL editor |
+| `UNRESOLVED_COLUMN ... HospitalId cannot be resolved. Did you mean ... HQ_CITY ...` from a Definitive view | The files behind the view were reloaded with different column names and the view was not updated. Happened to `physiciangroupsoverview` on 2026-10-07 (02:10 to 10:25 Eastern) | An upstream processing error: tell the view's owner (`databricks tables get prd_silver.definitive.<view> --profile jcl` shows who). Don't work around it in the `.sql` files; wait for the fix and rerun |
 | `--population 'X' is not in this run; choose one of [...]` | The label isn't a `zeus.sources` label | Use one from the list, e.g. `WorkLocation` |

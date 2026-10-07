@@ -14,9 +14,14 @@
 -- The output column names must match the roles configured for this block
 -- (id, name, address, city, state, zip); a run stops and names any that are
 -- missing. Extra columns are allowed and are kept in the run's snapshot.
+--
+-- HospitalId is cast to INT because since 2026-10-07 the view returns every
+-- column as a string (it was redefined over re-cut parquet that day). The
+-- tools convert ids with pd.to_numeric either way; the cast keeps the
+-- snapshot's id typed as it was in every earlier run.
 
 SELECT
-    HospitalId,
+    CAST(HospitalId AS INT) AS HospitalId,
     HospitalName,
     HeadquartersAddress,
     HeadquartersAddress1,

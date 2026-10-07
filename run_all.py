@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the whole audit in one go: both runs, then every workbook.
+"""Run the whole audit in one go: both runs, every workbook, the hierarchy.
 
   1. dhc_match_v2.py run          - the accuracy audit
   2. dhc_gap_match.py             - the coverage audit, cross-checked against 1
@@ -8,8 +8,13 @@
                                     see the same Definitive data
   3. build_audit_workbook.py      - accuracy workbook
   4. build_coverage_workbook.py   - coverage workbook
-  5. only if --population is given: steps 3 and 4 again, limited to that
+     only if --population is given: steps 3 and 4 again, limited to that
      population, as EXTRA workbooks beside the full ones
+  5. dhc_hierarchy.py             - the Definitive ownership hierarchy
+  6. zeus_hierarchy.py            - the Zeus HealthSystem > Client >
+                                    WorkLocation hierarchy, from 1, 2 and 5
+  Steps 5 and 6 need both audits, so --accuracy-only skips them, and
+  --no-hierarchy skips them on purpose.
 
 Both runs always score all six Zeus populations and the full workbooks are
 always built; --population never narrows or removes anything.
@@ -18,9 +23,9 @@ Each step is the existing script, run unchanged with this same Python, so its
 console output is exactly what Usage.md describes. The first step that fails
 stops the run. The end is a summary of the checks Usage.md asks for.
 
-  py run_all.py                                    # everything: 2 workbooks
+  py run_all.py                                    # everything: 4 workbooks
   py run_all.py --population WorkLocation          # the same, plus 2 Work Location workbooks
-  py run_all.py --population all                   # the same, plus 2 per population (14)
+  py run_all.py --population all                   # the same, plus 2 per population (16)
   py run_all.py --limit 200 --label smoke          # quick end-to-end test
 """
 import argparse
@@ -133,6 +138,8 @@ def main():
                          '(quick end-to-end test)')
     ap.add_argument('--no-reverse', action='store_true',
                     help='accuracy run skips the reverse lookup')
+    ap.add_argument('--no-hierarchy', action='store_true',
+                    help='skip the Definitive and Zeus hierarchy steps')
     a = ap.parse_args()
     if any(p.lower() == 'all' for p in a.population):
         a.population = population_labels(a.config)
@@ -166,6 +173,16 @@ def main():
                 step(f'4. Coverage workbook{name}',
                      ['build_coverage_workbook.py', '--candidates', cand,
                       '--accuracy', scored, '--config', a.config] + scope, log)
+
+        if cand and not a.no_hierarchy:
+            lines = step('5. Definitive hierarchy',
+                         ['dhc_hierarchy.py', '--config', a.config,
+                          '--accuracy', scored] + label, log)
+            hier = run_folder(lines, '5. Definitive hierarchy')
+            step('6. Zeus hierarchy',
+                 ['zeus_hierarchy.py', '--config', a.config,
+                  '--accuracy', scored, '--coverage', cand,
+                  '--definitive-hierarchy', hier] + label, log)
         failed = None
     except StepFailed as e:
         failed = str(e)

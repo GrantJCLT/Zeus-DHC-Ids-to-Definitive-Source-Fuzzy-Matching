@@ -2,10 +2,14 @@
 """Definitive Healthcare ownership hierarchy, one row per record.
 
 Built for comparison with the destination system data produced by the
-migration team. Hospital Overview only, by rule (2026-09-30); the parent rule
-- SfParentAccountId, else IdNetwork, else HospitalId (a root) - is defined in
-`Definitive Hospital Hierarchy.sql` and nowhere else. This script walks each
-record's ParentId up to its root and reports level, root and path.
+migration team, and as the Definitive half of the Zeus HealthSystem > Client >
+WorkLocation hierarchy (zeus_hierarchy.py). Every block under `hierarchy:` in
+the config is one Definitive view - Hospital Overview (hospitals and health
+systems) and, since 2026-10-07, Physician Group Overview - unioned into one
+tree. The parent rule - SfParentAccountId, else IdNetwork, else HospitalId (a
+root) - is defined in each view's `Definitive * Hierarchy.sql` and nowhere
+else. This script walks each record's ParentId up to its root and reports
+level, root and path.
 
 Every record carries two parents, labelled, because the tree is up to three
 levels deep (system > division or region > hospital) and the destination
@@ -24,8 +28,8 @@ Writes into its own folder, "Results Output/dhc_hierarchy_<YYYY_MM_DD_HHMM>/":
   <run>_hierarchy.csv                       every record, both parents, path
   <run>_hierarchy_immediate.csv             edge list: record -> direct owner
   <run>_hierarchy_ultimate.csv              edge list: record -> top-level owner
-  <run>_dhc_hospitalhierarchy.parquet/.sql  the Definitive snapshot and its SQL
-  Definitive_Hospital_Hierarchy_<run date and time>.xlsx
+  <run>_dhc_<snapshot>.parquet/.sql         each view's snapshot and its SQL
+  Definitive_Ownership_Hierarchy_<run date and time>.xlsx
 
 `--accuracy` adds the Zeus EntityIds that carry each id, read from a scored
 accuracy run, so the output can be compared by either key.
@@ -44,22 +48,49 @@ from build_audit_workbook import FILL_NAVY, FILL_PURPLE, H1, H2, SECTION, \
 SEP = ' > '
 
 
+def hierarchy_blocks(cfg):
+    """The `hierarchy:` blocks, one per Definitive view. A single mapping (the
+    2026-09-30 form, Hospital Overview only) is still accepted."""
+    h = cfg.get('hierarchy')
+    if not h:
+        raise SystemExit('No `hierarchy:` block in the config.')
+    return [dict(b) for b in (h if isinstance(h, list) else [h])]
+
+
+def resolve_hierarchy_prefix(cfg, src):
+    """The snapshot prefix behind a run folder (or a prefix, passed through).
+
+    A hierarchy run folder has no Zeus extract, so its prefix is read off the
+    first view's snapshot; any other run folder falls back to resolve_prefix.
+    """
+    if not src or not os.path.isdir(src):
+        return src
+    tail = f'_dhc_{hierarchy_blocks(cfg)[0]["snapshot"]}.parquet'
+    hits = [f for f in os.listdir(src) if f.endswith(tail)]
+    return (os.path.join(src, hits[0][:-len(tail)]) if len(hits) == 1
+            else resolve_prefix(src))
+
+
 def load_hierarchy(cfg, prefix, definitive_from=None):
-    """The hierarchy snapshot for this run, queried live or replayed."""
-    b = dict(cfg['hierarchy'])
-    one = {'databricks': cfg.get('databricks'), 'definitive': [b]}
+    """Every hierarchy view's snapshot for this run, queried live or replayed,
+    unioned into one frame. `Source_View` names the snapshot a row came from."""
+    blocks = hierarchy_blocks(cfg)
     if definitive_from:
-        materialise_tables({'definitive': [dict(b)]}, definitive_from,
+        materialise_tables({'definitive': blocks}, definitive_from,
                            replay=True, copy_to=prefix)
-        b['path'] = f'{prefix}_dhc_{b["snapshot"]}.parquet'
     else:
-        materialise_tables(one, prefix)
-    df = pd.read_parquet(b['path'])
+        materialise_tables({'databricks': cfg.get('databricks'),
+                            'definitive': blocks}, prefix)
+    df = pd.concat([pd.read_parquet(b['path']).assign(Source_View=b['snapshot'])
+                    for b in blocks], ignore_index=True)
     for c in ('HospitalId', 'ParentId', 'SfParentAccountId', 'IdNetwork'):
         df[c] = pd.to_numeric(df[c]).astype('Int64')
-    if df.HospitalId.duplicated().any():
-        raise SystemExit(f'{df.HospitalId.duplicated().sum()} duplicate '
-                         f'HospitalId rows in the hierarchy source.')
+    dup = df[df.HospitalId.duplicated(keep=False)]
+    if len(dup):
+        raise SystemExit(f'{dup.HospitalId.nunique():,} HospitalId value(s) '
+                         f'appear more than once across the hierarchy views '
+                         f'({sorted(dup.Source_View.unique())}); Definitive ids '
+                         f'are meant to be one namespace with no overlap.')
     return df
 
 
@@ -160,7 +191,7 @@ LABELS = {
     'Root_TypeFirm': 'Ultimate_Parent_TypeFirm',
 }
 COLUMNS = ['HospitalId', 'HospitalName', 'TypeFirm', 'TypeHospital',
-           'CompanyStatus', 'HqCity', 'HqState', 'Is_Root',
+           'CompanyStatus', 'HqCity', 'HqState', 'Source_View', 'Is_Root',
            'ParentId', 'ParentName', 'Parent_TypeFirm', 'Parent_Rule',
            'Parent_In_Definitive', 'Level', 'Child_Count',
            'RootId', 'RootName', 'Root_TypeFirm', 'Ultimate_Level',
@@ -203,19 +234,28 @@ ZEUS_COLUMNS = ['Zeus_Entity_Count', 'Zeus_EntityIds', 'Zeus_Sources',
 
 
 def checks(h):
-    """Identities that must hold; printed and written to the Summary."""
+    """Identities that must hold, as (label, left, right): printed as
+    `label  left == right  OK|FAIL` - the form run_all.py collects - and
+    written to the Summary."""
     roots = h[h.Is_Root]
     # Records under a root that is not itself a Definitive record (its id is
     # a parent missing from the view) belong to no root's Descendant_Count.
     orphaned = int((~h.RootId.isin(roots.HospitalId)).sum())
     return [
-        ('Every record has exactly one parent', h.ParentId.notna().all()),
-        ('Level 0 records are exactly the self-parented roots',
-         ((h.Level == 0) == h.Is_Root).all()),
-        ('Roots + their descendants + records under missing parents = all',
-         len(roots) + roots.Descendant_Count.sum() + orphaned == len(h)),
-        ('No cycles', (h.Hierarchy_Issue != 'Cycle').all()),
+        ('records with exactly one parent = records',
+         int(h.ParentId.notna().sum()), len(h)),
+        ('level 0 records = self-parented roots',
+         int((h.Level == 0).sum()), int(h.Is_Root.sum())),
+        ('roots + descendants + under missing parents = records',
+         int(len(roots) + roots.Descendant_Count.sum() + orphaned), len(h)),
+        ('records in a cycle = 0',
+         int((h.Hierarchy_Issue == 'Cycle').sum()), 0),
     ]
+
+
+def print_checks(rows):
+    for k, a, b in rows:
+        print(f'  {k:<54} {a:,} == {b:,}  {"OK" if a == b else "FAIL"}')
 
 
 def _xl(df):
@@ -230,37 +270,36 @@ def build_workbook(h, path, run, zeus_info):
     for col, w in zip('ABCDE', (4, 46, 16, 16, 60)):
         ws.column_dimensions[col].width = w
     ws.merge_cells('A1:E1')
-    _put(ws, 'A1', 'Jackson and Coker Locum Tenens - Definitive Hospital '
-                   'Ownership Hierarchy', H1, FILL_NAVY)
+    _put(ws, 'A1', 'Jackson and Coker Locum Tenens - Definitive Ownership '
+                   'Hierarchy', H1, FILL_NAVY)
     ws.merge_cells('A2:E2')
-    _put(ws, 'A2', f'Run {run} - Definitive Hospital Overview, one row per '
-                   f'record', H2, FILL_PURPLE)
+    _put(ws, 'A2', f'Run {run} - {", ".join(sorted(h.Source_View.unique()))}, '
+                   f'one row per record', H2, FILL_PURPLE)
 
     roots = h[h.Is_Root]
     ext = h[h.Hierarchy_Issue == 'Parent_Not_In_Definitive']
     trees = h.groupby('RootId').size()
     multi = int((trees > 1).sum())
+    types = h.TypeFirm.fillna('(blank)').value_counts()
     _put(ws, 'B4', 'Headline', SECTION)
     ws.merge_cells('B5:E8')
     _put(ws, 'B5',
-         f'Definitive Hospital Overview holds {len(h):,} records '
-         f'({(h.TypeFirm == "Hospital").sum():,} hospitals and '
-         f'{(h.TypeFirm == "Health System").sum():,} health systems). Each '
-         f'record\'s immediate parent is its SfParentAccountId, else its '
-         f'IdNetwork, else the record itself. That arranges them into '
+         f'The Definitive hierarchy views hold {len(h):,} records ('
+         + ', '.join(f'{n:,} {t}' for t, n in types.items()) +
+         f'). Each record\'s immediate parent is its SfParentAccountId, else '
+         f'its IdNetwork, else the record itself. That arranges them into '
          f'{trees.size:,} trees: {multi:,} with more than one member and '
          f'{trees.size - multi:,} standalone records, at most '
          f'{h.Level.max()} levels deep. Each record is given two parents: its '
          f'immediate parent (direct owner) and its ultimate parent (top-level '
          f'owner). They differ for the {int(h.Has_Intermediate_Parent.sum()):,} '
          f'records owned through a division or region. {len(ext):,} '
-         f'record(s) name a parent that is not in Hospital Overview. They are '
+         f'record(s) name a parent that is in none of the views. They are '
          f'kept, and flagged on Hierarchy_Issues.', align=WRAP)
 
-    r = _table(ws, 10, ['Immediate_Level', 'Records', 'Hospitals',
-                        'Health systems'],
-               [[int(lv), len(g), int((g.TypeFirm == 'Hospital').sum()),
-                 int((g.TypeFirm == 'Health System').sum())]
+    r = _table(ws, 10, ['Immediate_Level', 'Records'] + list(types.index),
+               [[int(lv), len(g)] + [int((g.TypeFirm.fillna('(blank)') == t)
+                                         .sum()) for t in types.index]
                 for lv, g in h.groupby('Level')])
     mid, n_root = int(h.Has_Intermediate_Parent.sum()), int(h.Is_Root.sum())
     _put(ws, f'B{r}', 'Immediate versus ultimate parent', SECTION)
@@ -291,28 +330,33 @@ def build_workbook(h, path, run, zeus_info):
         r = _table(ws, r + 1, ['Measure', 'Count'], [
             ['Zeus entities in the accuracy run with a Definitive id',
              n_scored],
-            ['... whose id is a Hospital Overview record', n_in],
-            ['Hospital Overview records carried by a Zeus entity',
+            ['... whose id is a record in this hierarchy', n_in],
+            ['Hierarchy records carried by a Zeus entity',
              len(linked)],
             ['Trees with at least one Zeus-linked record',
              int(linked.RootId.nunique())]])
     _put(ws, f'B{r}', 'Identity checks', SECTION)
-    r = _table(ws, r + 1, ['Check', 'Result'],
-               [[k, 'OK' if v else 'FAIL'] for k, v in checks(h)])
+    r = _table(ws, r + 1, ['Check', 'Left', 'Right', 'Result'],
+               [[k, a, b, 'OK' if a == b else 'FAIL'] for k, a, b in checks(h)])
 
     build_methodology(wb, [
-        ('Source', 'prd_silver.definitive.hospitaloverview only, per the rule '
-                   'set on 2026-09-30. It holds hospitals and health systems, '
-                   'so health systems appear as ordinary records and as the '
-                   'parents of hospitals. Physician groups, GPOs and practice '
-                   'locations are not in this hierarchy.'),
+        ('Source', 'One Definitive view per block under `hierarchy:` in the '
+                   'config, unioned into one tree; Source_View says which. '
+                   'Hospital Overview holds hospitals and health systems, so '
+                   'health systems appear as ordinary records and as the '
+                   'parents of hospitals. Physician Group Overview was added '
+                   'on 2026-10-07; a group\'s parent can be a hospital, a '
+                   'health system, or an id in neither view. GPOs and practice '
+                   'locations are not in this hierarchy: the GPO view has no '
+                   'parent column, and a practice location has no stable id '
+                   'of its own.'),
         ('Parent rule', 'Immediate_ParentId = SfParentAccountId if present; '
                         'otherwise IdNetwork; otherwise the record\'s own '
                         'HospitalId, which makes it a root. '
                         'Immediate_Parent_Rule says which step decided. The '
-                        'rule is defined in "Definitive Hospital '
+                        'rule is defined in each view\'s "Definitive * '
                         'Hierarchy.sql", and the SQL that ran is saved beside '
-                        'the snapshot.'),
+                        'each snapshot.'),
         ('Immediate parent', 'The direct owner in the full tree. It can be a '
                              'division or regional system, e.g. HCA Medical '
                              'City Healthcare or VISN 1. Immediate_Level 0 is '
@@ -339,8 +383,9 @@ def build_workbook(h, path, run, zeus_info):
                                         'record below it at any depth. For a '
                                         'root, that is the size of its tree, '
                                         'less itself.'),
-        ('Parents not in Definitive', 'A parent id missing from Hospital '
-                                      'Overview ends the walk. That id becomes '
+        ('Parents not in Definitive', 'A parent id missing from every '
+                                      'hierarchy view ends the walk. That id '
+                                      'becomes '
                                       'the root, named from the child\'s '
                                       'SfParentAccountName or NameNetwork, and '
                                       'Parent_In_Definitive is False. These '
@@ -358,8 +403,10 @@ def build_workbook(h, path, run, zeus_info):
     sheet_data(wb, 'Immediate_Parent', _xl(immediate_edges(h)))
     sheet_data(wb, 'Ultimate_Parent', _xl(ultimate_edges(h)))
     sheet_data(wb, 'Hierarchy', _xl(labelled(h)))
-    sheet_data(wb, 'Roots', _xl(roots.sort_values('Descendant_Count',
-                                                  ascending=False)
+    # Roots that own something. Standalone records (a root with no descendant)
+    # are ~140,000 once physician groups are in, and are on Hierarchy anyway.
+    sheet_data(wb, 'Roots', _xl(roots[roots.Descendant_Count > 0]
+                                .sort_values('Descendant_Count', ascending=False)
                                 .rename(columns=LABELS)))
     sheet_data(wb, 'Hierarchy_Issues',
                _xl(labelled(h[h.Hierarchy_Issue != ''])))
@@ -383,15 +430,7 @@ def main():
     a = ap.parse_args()
 
     cfg = load_config(a.config)
-    if not cfg.get('hierarchy'):
-        raise SystemExit('No `hierarchy:` block in the config.')
-    src = a.definitive_from
-    if src and os.path.isdir(src):
-        hits = [f for f in os.listdir(src) if f.endswith(
-            f'_dhc_{cfg["hierarchy"]["snapshot"]}.parquet')]
-        src = (os.path.join(src, hits[0][:-len(
-            f'_dhc_{cfg["hierarchy"]["snapshot"]}.parquet')])
-            if len(hits) == 1 else resolve_prefix(src))
+    src = resolve_hierarchy_prefix(cfg, a.definitive_from)
     prefix = new_run_prefix('dhc_hierarchy', a.label, a.results_dir)
     h = walk(load_hierarchy(cfg, prefix, src))
 
@@ -408,8 +447,11 @@ def main():
     immediate_edges(h).to_csv(f'{prefix}_hierarchy_immediate.csv', index=False)
     ultimate_edges(h).to_csv(f'{prefix}_hierarchy_ultimate.csv', index=False)
     trees = h.groupby('RootId').size()
-    print(f'Records     : {len(h):,}  ({(h.TypeFirm == "Hospital").sum():,} '
-          f'hospitals, {(h.TypeFirm == "Health System").sum():,} health systems)')
+    print(f'Records     : {len(h):,}  ('
+          + ', '.join(f'{n:,} {t}' for t, n in
+                      h.TypeFirm.fillna('(blank)').value_counts().items()) + ')')
+    for k, n in h.Source_View.value_counts().items():
+        print(f'  from {k:<25}: {n:,}')
     print(f'Trees       : {trees.size:,}  ({(trees > 1).sum():,} with more than '
           f'one member), max depth {h.Level.max()}')
     print(f'Parents     : {h.Has_Intermediate_Parent.sum():,} records have an '
@@ -420,14 +462,13 @@ def main():
           f'{h.Hierarchy_Issue[h.Hierarchy_Issue != ""].value_counts().to_dict()}')
     if zeus_info:
         print(f'Zeus        : {zeus_info[1]:,} of {zeus_info[0]:,} scored '
-              f'entities carry a Hospital Overview id; '
+              f'entities carry an id in this hierarchy; '
               f'{(h.Zeus_Entity_Count > 0).sum():,} records are Zeus-linked')
-    for k, v in checks(h):
-        print(f'  {"OK  " if v else "FAIL"} {k}')
-    print(f'Wrote       : {out}  (+ _immediate.csv, _ultimate.csv)')
-    wbp = workbook_path(prefix, 'Definitive_Hospital_Hierarchy')
+    print_checks(checks(h))
+    print(f'Wrote {out}  (+ _immediate.csv, _ultimate.csv)')
+    wbp = workbook_path(prefix, 'Definitive_Ownership_Hierarchy')
     build_workbook(h, wbp, os.path.basename(prefix), zeus_info)
-    print(f'Wrote       : {wbp}')
+    print(f'Wrote {wbp}')
 
 
 if __name__ == '__main__':

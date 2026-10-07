@@ -17,6 +17,7 @@ so column roles come from a config file. Use --inspect to generate one.
 Requires: pandas, numpy, openpyxl, rapidfuzz  (pyyaml optional - JSON works too)
 """
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -780,6 +781,28 @@ def _conn_str(c):
     return ';'.join(parts)
 
 
+@contextlib.contextmanager
+def zeus_connect(c):
+    """A Zeus connection from the `connection` block, reporting where it landed.
+
+    Every tool that reads Zeus opens it here, so the ReadOnly intent and the
+    check that it was honoured live in one place. The `connected to a ...
+    database` line is what Usage.md and run_all.py look for.
+    """
+    import pyodbc
+    print(f'Zeus source : {c.get("database")} on {c.get("host")}')
+    print(f'  intent    : {c.get("application_intent", "ReadWrite")}')
+    with pyodbc.connect(_conn_str(c)) as cx:
+        upd = cx.execute(
+            "SELECT DATABASEPROPERTYEX(DB_NAME(), 'Updateability')"
+        ).fetchval()
+        print(f'  connected to a {upd} database')
+        if c.get('application_intent') == 'ReadOnly' and upd != 'READ_ONLY':
+            print('  WARNING: ReadOnly intent was requested but this '
+                  'connection landed on a writable database.')
+        yield cx
+
+
 # Canonical shape every Zeus population is mapped onto, so downstream code is
 # free of per-population column names.
 Z_NAMES = ['Z_Name1', 'Z_Name2']
@@ -907,26 +930,16 @@ def load_zeus(zc, out_prefix=None):
                   'Phone_Match will be blank throughout.')
             u['Z_Phones'] = None
     else:
-        import pyodbc
         c = zc.get('connection') or {}
         srcs = zc.get('sources') or []
         if not srcs:
             raise SystemExit('zeus config needs `sources` (or `path`).')
-        print(f'Zeus source : {c.get("database")} on {c.get("host")}')
-        print(f'  intent    : {c.get("application_intent", "ReadWrite")}')
         # Which key names the query file. The missing-id audit reuses these
         # same role mappings against a different query per population, so it
         # sets query_key rather than duplicating the `sources` block.
         qk = zc.get('query_key', 'query_file')
         frames = []
-        with pyodbc.connect(_conn_str(c)) as cx:
-            upd = cx.execute(
-                "SELECT DATABASEPROPERTYEX(DB_NAME(), 'Updateability')"
-            ).fetchval()
-            print(f'  connected to a {upd} database')
-            if c.get('application_intent') == 'ReadOnly' and upd != 'READ_ONLY':
-                print('  WARNING: ReadOnly intent was requested but this '
-                      'connection landed on a writable database.')
+        with zeus_connect(c) as cx:
             for s in srcs:
                 qf = s.get(qk)
                 if not qf:

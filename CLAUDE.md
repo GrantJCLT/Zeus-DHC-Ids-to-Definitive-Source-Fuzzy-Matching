@@ -8,6 +8,10 @@ Two questions about the same link, over one universe of Zeus entities:
   how often does it point at the right Definitive record? `dhc_match_v2.py`.
 - **Coverage** — which entities carry no DHC ID at all, and which Definitive
   record should each of them point at? `dhc_gap_match.py`, added 2026-08-19.
+- **Hierarchy** — one Health System > Client > Work Location tree for Zeus,
+  from Definitive ownership first and Zeus links second, built on the two
+  audits' resolved ids. `zeus_hierarchy.py`, added 2026-10-07; see
+  `Hierarchy_Logic.md` and decisions #16-#18.
 
 Zeus is Jackson and Coker's internal CRM. Verification is by fuzzy comparison of
 name and address between the two sides — there is no authoritative key to check
@@ -54,7 +58,9 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   `py build_coverage_workbook.py --candidates <run>_gap_candidates.csv
   [--accuracy <audit>_scored.csv] [--out <name>.xlsx]`
 - `run_all.py` — runs everything in order, added 2026-09-30: accuracy run,
-  coverage run, both workbooks, and scoped workbooks for each `--population`
+  coverage run, both workbooks, then (since 2026-10-07, unless
+  `--no-hierarchy` or `--accuracy-only`) `dhc_hierarchy.py` and
+  `zeus_hierarchy.py`, and scoped workbooks for each `--population`
   (`--population all`, added 2026-10-05, expands to every `zeus.sources`
   label read from the config, so the list is never hard-coded).
   Calls the four scripts unchanged as subprocesses with its own
@@ -63,14 +69,42 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   run**, so both audits score against one Definitive state (the views refresh
   in place). Stops at the first failing step; ends with a summary of the
   READ_ONLY, NOTE, WARNING and identity-check lines, exit code 1 if any
-  failed. `py run_all.py --limit 200 --label smoke` is a 4-minute end-to-end
+  failed. `py run_all.py --limit 200 --label smoke` is a 6-minute end-to-end
   test.
-- `dhc_hierarchy.py` — the Definitive hospital ownership hierarchy, added
-  2026-09-30 for comparison with the migration team's destination data. It
-  reads **Hospital Overview only**, by rule, via `Definitive Hospital
-  Hierarchy.sql` (the `hierarchy:` block in `sources.yaml`). Parent =
-  `SfParentAccountId`, else `IdNetwork`, else the record's own `HospitalId`
-  (a root). The rule lives in the SQL only, and the script just walks it.
+- `zeus_hierarchy.py` — the Zeus Health System > Client > Work Location
+  hierarchy, added 2026-10-07. Reads both audits (all four output files, which
+  partition the in-scope universe), a `dhc_hierarchy.py` run's snapshots
+  (`--definitive-hierarchy`) and three Zeus queries (`--zeus-links` replays
+  them): `Zeus hierarchy links.sql` (every active `LinkClientWorkLocation` and
+  `LinkHealthSystemClient` row, with bookings and link history), `Zeus linked
+  import entities.sql` and `Zeus entity duplicates.sql`. One parent and one
+  type per entity (decision #16). Writes `_hierarchy_edges.csv` (the tree),
+  `_hierarchy_nodes.csv` (everything, with `Entity_Type` and
+  `Zeus_Link_Status`), `_contradictions.csv`, `_zeus_links_replaced.csv`,
+  `_zeus_links_dropped.csv`, `_resolution.csv`, the input snapshots, and
+  `Zeus_Entity_Hierarchy_<run>.xlsx`. Nine identity checks in `X == Y  OK`
+  form. A replay from its own folder is byte-identical
+  (verified 2026-10-07). The rules are in `Hierarchy_Logic.md`; the decisions
+  are #16-#18 below.
+- `Hierarchy_Logic.md` — reference for the Zeus hierarchy, written
+  2026-10-07: nodes, universe, resolution bases, the Definitive parent walk,
+  every `Zeus_Link_Status`, the Zeus tie-break, duplicates, measured results,
+  open questions and a change log. **Update it whenever a hierarchy rule
+  changes**, with before/after figures from a replay.
+- `dhc_hierarchy.py` — the Definitive ownership hierarchy, added 2026-09-30
+  for comparison with the migration team's destination data. It reads every
+  block under `hierarchy:` in `sources.yaml` and unions them: Hospital
+  Overview (`Definitive Hospital Hierarchy.sql`) and, since 2026-10-07,
+  Physician Group Overview (`Definitive Physician Group Hierarchy.sql`;
+  decision #18). Parent = `SfParentAccountId`, else `IdNetwork`, else the
+  record's own `HospitalId` (a root). The rule lives in each SQL file only, and
+  the script just walks it. The workbook is
+  `Definitive_Ownership_Hierarchy_<run>.xlsx` (was
+  `Definitive_Hospital_Hierarchy_...` before physician groups). With physician
+  groups in: 153,508 records, 142,595 trees (1,566 with more than one member),
+  depth ≤ 3, 2,768 parents outside both views (corporate owners such as The US
+  Oncology Network, AMSURG, RadNet), 95.7% of groups standalone. The
+  hospital-only figures that follow are from 2026-09-30.
   Every record gets **both** an `Immediate_Parent*` (direct owner, full tree,
   depth ≤ 2) and an `Ultimate_Parent*` (top-level owner, flattened), labelled.
   Both are kept by Grant's decision on 2026-09-30, because the destination
@@ -90,8 +124,13 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   health system, `IdNetwork` is the record's own id, and `SfParentAccountId`
   is the larger system above it (363). So step 2 never yields a parent that
   steps 1 and 3 would not. It is kept as specified in case Definitive ever
-  populates `IdNetwork` without `SfParentAccountId`. Physician groups, GPOs
-  and practice locations are out of scope "at this time".
+  populates `IdNetwork` without `SfParentAccountId`. Physician groups behave
+  the same way (2026-10-07): 6,205 of 143,617 have a parent, every one through
+  `SF_PARENT_ACCOUNT_ID`, pointing at a hospital (2,358), a health system
+  (1,080) or a corporate owner in neither view (2,767). GPOs and practice
+  locations stay out: the GPO view has no parent column, and a practice
+  location has no stable id of its own (`LocationId` is unique per
+  physician-location row).
 - `Zeus_DHC_ID_Audit_Business_Overview.md` — plain-language overview of the
   project for business readers, written 2026-09-28 from the 2026-08-12 and
   2026-08-19 runs. Its figures are hand-copied, so update it after a new run.
@@ -150,6 +189,39 @@ the wider BI estate is SQL Server, Azure Databricks, Power BI, Azure DevOps
   `WHERE PracticeLocationHospitalId IS NOT NULL` reduce it to one row per
   location of a known parent — drop either and the location set is wrong
   (~1.09M distinct locations carry no parent id).
+
+  **The physician-group view broke for eight hours on 2026-10-07.** A
+  processing error reloaded the parquet behind `physiciangroupsoverview` at
+  02:10 Eastern with UPPER_SNAKE names (`HOSPITAL_ID`, `HQ_CITY`), every
+  column a string, while the view (owner jborn@) still selected `HospitalId`,
+  so every query of it failed `UNRESOLVED_COLUMN` — both audits included. The
+  view was redefined over the new files at 10:25 Eastern (mangala.iyer@) and
+  works again, but **now returns every column as a string**; the tools convert
+  ids with `pd.to_numeric`, and both physician-group queries cast `HospitalId`
+  to INT so snapshots keep their type. The 2026-10-07 08:34 runs
+  (`dhc_match_v2_2026_10_07_0834` and the coverage, hierarchy and Zeus
+  hierarchy runs built on it) read the parquet directly with the names aliased
+  back — their snapshot `.sql` files show it — and matched the 2026-10-05 runs
+  (12,803 entities, 11,097 testable). That workaround was removed once the view
+  was fixed; if a view breaks the same way again, tell its owner rather than
+  routing around the governed view. The view also has columns no tool read
+  before 2026-10-07: `NetworkId`, `NetworkParentId`, `HospitalParentId`,
+  `SfParentAccountId` (the parent; 4.3% filled), `NationalProviderIdNumber`
+  (89% filled), `CompanyStatus`, `FirmType`.
+- **Three Zeus hierarchy queries**, read by `zeus_hierarchy.py` only (keys
+  `hierarchy_query_file`, `linked_import_query_file`, `duplicates_query_file`
+  under `zeus:`): `Zeus hierarchy links.sql`, `Zeus linked import
+  entities.sql`, `Zeus entity duplicates.sql`. The first two read tables no
+  other query touches — `dbo.LinkClientWorkLocation`,
+  `dbo.LinkHealthSystemClient`, `dbo.LinkClientWorkLocationHistory`,
+  `dbo.BookingClientWorkLocation`, `dbo.Booking`. Measured 2026-10-07 on the
+  in-scope population: 99.3% of work locations have a client link (7,905 have
+  two or more; 11,996 links are an entity linked to itself); 80% of clients
+  have no health system link (2,321 have two or more);
+  `HealthSystemInfo.HealthSystemInfoParentId` is filled on 3 rows, so Zeus has
+  no health system hierarchy of its own. 13,441 work location -> client and
+  3,138 client -> health system links point at Definitive-import-created
+  entities, which the audits exclude — hence decision #17's universe rule.
 - `Zeus_DHC_ID_Accuracy_Audit.xlsx` — **kept as the reporting format template,
   not as a result.** Its numbers are file-era and must not be quoted; see
   "Reporting template" below for the structure worth reusing.
@@ -477,10 +549,11 @@ The folder is a git repo with a **private** GitHub remote,
 `GrantJCLT/Zeus-DHC-Ids-to-Definitive-Source-Fuzzy-Matching`. Keep it private:
 the history contains licensed Definitive exports and Zeus client records.
 
-Only source is tracked — the four scripts plus `run_all.py` and `dhc_hierarchy.py`, `sources.yaml`,
-the eighteen `.sql` files (twelve Zeus population queries, the Zeus phone
-query, four Definitive sources, the hospital hierarchy), this file, `Usage.md`, `Environment.md`,
-`Matching_Logic.md`, the business overview, and `.gitignore`. Everything else is deliberately ignored:
+Only source is tracked — the four scripts plus `run_all.py`, `dhc_hierarchy.py` and `zeus_hierarchy.py`, `sources.yaml`,
+the twenty-two `.sql` files (twelve Zeus population queries, the Zeus phone
+query, the three Zeus hierarchy queries, four Definitive sources, the hospital
+and physician-group hierarchies), this file, `Usage.md`, `Environment.md`,
+`Matching_Logic.md`, `Hierarchy_Logic.md`, the business overview, and `.gitignore`. Everything else is deliberately ignored:
 
 | Ignored | Why |
 |---|---|
@@ -841,6 +914,65 @@ naive alternative was measurably wrong.
     of the string weigh more; measure it before adding one. Full figures are in
     `Matching_Logic.md`'s change log.
 
+16. **One type per entity, the highest level wins, and the tree is strict**
+    (2026-10-07, Grant). One parent per entity; alternatives are listed, never
+    kept as extra parents. Each entity is typed by the highest of its Zeus
+    roles — HealthSystem over Client over WorkLocation — because the migration
+    team's hierarchy, which this one exists to validate, gives every entity one
+    type. A parent is always a higher type, or a health system under a health
+    system to any depth; a work location may sit directly under a health
+    system. Consequences, measured on the first full run's inputs: 13,976
+    entities carry several Zeus roles; 14,189 Zeus self-links (a hospital as
+    its own client) and 11,573 same-type links (almost all a hospital, now a
+    Client, linked as a work location to a staffing firm) no longer fit and
+    are set aside and listed; Zeus client links between two entities typed
+    HealthSystem become health system edges, and the 8 pairs that pointed at
+    each other are broken (`break_loops()`), keeping Definitive's edge where
+    there is one. The first build keyed nodes on (EntityId, role) instead;
+    that was replaced the same day and should not come back unless the
+    comparison target changes.
+
+17. **Definitive ownership beats Zeus, except where it completely contradicts
+    Zeus; and a shared Definitive record is identity, not ownership**
+    (2026-10-07). Grant's rule: a known Definitive ownership or parent
+    relationship takes priority, but where every Zeus parent sits in a
+    different Definitive tree (different ultimate owner) the case is a
+    `Contradiction` — held, the Zeus link kept for now, listed. The Definitive
+    ids trusted for this are corroborated or probable supplied ids (no
+    `Geo_Conflict`), recommended corrections and strong coverage proposals;
+    Definitive-import-created entities become nodes only where Zeus links them
+    to an in-scope entity, plus the parents those need. The first run let a
+    Zeus entity on the child's *own* Definitive record (distance 0) override
+    Zeus too, and replaced 1,936 contracting clients — SCP Health, HealthTrust
+    Workforce Solutions, Sound Inpatient Physicians — with the hospital itself.
+    So a same-record match may confirm or fill but never replace or contradict;
+    only an owner (distance ≥ 1) may. Work location replacements fell 2,509 ->
+    1,336, contradictions 408 -> 240. Full rules in `Hierarchy_Logic.md`.
+    **Hospital owners take priority over staffing firms** (Grant, 2026-10-07),
+    because staffing firms are not the owners of the work locations they
+    staff. Two consequences: a hospital's Definitive owner replaces a Zeus
+    client with no trusted Definitive id (1,628 work-location links on the
+    single-type run, most often TEAMHealth, Trio, HealthTrust Workforce
+    Solutions, SCP Health); and a work location whose Definitive owner is a
+    hospital or health system (`TypeFirm`) while every Zeus client is a
+    physician group, MSO or practice is **not** a contradiction but
+    `Definitive replaces` (200 work locations). Contradictions stay held where
+    Zeus names a different hospital or health system (often a merger Zeus has
+    not caught up with: Mountain States Health Alliance vs Ballad Health),
+    where both sides are physician groups, and at the client and health system
+    levels — 110 work locations, 260 clients and 3 health systems on the
+    single-type run. Also confirmed that day: a client with no health system
+    is expected, and the booking tie-break applies only where Definitive gives
+    no parent.
+
+18. **Physician groups are in the Definitive hierarchy** (2026-10-07),
+    reversing the 2026-09-30 note that they were out of scope "at this time".
+    The Zeus hierarchy needs a parent chain for every id a Zeus entity can
+    resolve to, and ~2,500 accuracy ids plus ~6,500 strong coverage proposals
+    are physician groups. Same columns and same parent rule as the hospital
+    file, unioned in `load_hierarchy()`; ids never overlap between the views,
+    and a run stops if they do. GPOs and practice locations stay out.
+
 ## Reporting template
 
 `Zeus_DHC_ID_Accuracy_Audit.xlsx` is retained for its **shape**, which is the
@@ -1076,6 +1208,23 @@ it raises:
 - **~~A deliverable workbook.~~ Done 2026-08-19** �
   `build_coverage_workbook.py`, twelve sheets, latest output
   `Zeus_DHC_ID_Coverage_Audit_2026_08_19.xlsx`.
+
+**8. Hierarchy follow-ups, opened 2026-10-07.** `zeus_hierarchy.py` exists
+and has had its first full run (`zeus_hierarchy_2026_10_07_0858`). **It is a
+read-only comparison tool**: the migration team derives the real hierarchy,
+and this one is the baseline Grant validates theirs against. Nothing is ever
+written back to Zeus or any other source; an Excel deliverable is the output.
+What it raises:
+
+- **Compare with the migration team's hierarchy** once their output is
+  available. The comparison itself is not built yet.
+- **Hand-label ~50 `Contradictions` and ~50 `Zeus_Links_Replaced` rows**, as
+  planned, to put a measured precision on the Definitive pass. No reviewer is
+  assigned yet (2026-10-07); contradictions keep their Zeus link meanwhile.
+- **Health system resolution.** Large Definitive systems (UNC Health,
+  Piedmont, Baptist Health - AR) have no Zeus health system node carrying
+  their id, so their clients climb past them; 91 have an unlinked
+  import-created Zeus record that decision #17's universe rule leaves out.
 
 ## Residual weakness
 
